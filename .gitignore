@@ -1,4 +1,7 @@
 *.elc
 /.tests/
 /build/
+/result
+/.direnv/
+/.pre-commit-config.yaml
 *.log

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    # The repository's mainline (`dev`) and its release branch. `agents` has
+    # no CI by policy: work landing there runs the same recipes locally.
+    branches: [dev, stable]
+  pull_request:
+
+jobs:
+  # Every job runs a `just` recipe inside the flake's dev shell, so a failure
+  # reproduces locally with the same command. The Nix-capable legs only: the
+  # dev shell is a flake.
+  lint:
+    name: Lint (${{ join(matrix.runner, '-') }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - [self-hosted, linux, x64]
+          - [self-hosted, linux, arm64]
+          - [self-hosted, macos, arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+      - name: just lint
+        run: |
+          mkdir -p test-logs
+          nix develop --command just lint 2>&1 | tee test-logs/lint.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-logs-${{ join(matrix.runner, '-') }}
+          path: test-logs/
+          retention-days: 30
+
+  test:
+    name: Test (${{ join(matrix.runner, '-') }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - [self-hosted, linux, x64]
+          - [self-hosted, linux, arm64]
+          - [self-hosted, macos, arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+      - name: just test
+        run: |
+          mkdir -p test-logs
+          nix develop --command just test 2>&1 | tee test-logs/test.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ join(matrix.runner, '-') }}
+          path: test-logs/
+          retention-days: 30
+
+  nix-build:
+    name: Nix build (${{ join(matrix.runner, '-') }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - [self-hosted, linux, x64]
+          - [self-hosted, linux, arm64]
+          - [self-hosted, macos, arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+      - name: nix build
+        run: |
+          mkdir -p test-logs
+          nix build .#default --print-build-logs 2>&1 | tee test-logs/nix-build.log
+          nix flake check --print-build-logs 2>&1 | tee -a test-logs/nix-build.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-build-logs-${{ join(matrix.runner, '-') }}
+          path: test-logs/
+          retention-days: 30
