@@ -46,6 +46,18 @@ or named by `codetracer-server-program`.
 - The source window follows the debugger. The execution line is
   highlighted with an arrow in the fringe, breakpoints and tracepoints are
   fringe marks, and recorded values are shown at the ends of lines.
+- A source that is not on this disk is read from the recording into a
+  read-only buffer; `codetracer-sources` opens any of the recording's
+  sources.
+- `codetracer-show-frames` shows the frames of a recording that carries
+  graphics, drawn as images when Emacs can display them.
+- The file tree is CodeTracer's file pane by default. Set
+  `codetracer-panels-file-tree` to `editor` to use Emacs instead: a `dired`
+  listing of the recording's sources takes the pane's place, and the files
+  you select, open, create, rename and delete are reported to CodeTracer.
+- Sessions survive a restart with `desktop-save-mode`: the recordings are
+  opened again and their panes keep the windows you arranged, beside your
+  own.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 

@@ -58,6 +58,8 @@
 (require 'jsonrpc)
 (require 'tab-bar)
 (require 'subr-x)
+(require 'dired)
+(require 'filenotify)
 
 (defvar desktop-save-buffer)
 (defvar desktop-buffer-mode-handlers)
@@ -81,6 +83,16 @@
 (defcustom codetracer-server-environment nil
   "Extra environment entries for the pane server, as \"NAME=VALUE\" strings."
   :type '(repeat string))
+
+(defcustom codetracer-panels-file-tree 'codetracer
+  "Who fills the file-tree role: CodeTracer's file pane, or Emacs.
+With `editor', the file tree's place in a layout shows a `dired'
+listing of the recording's sources (the files it recorded, read-only
+copies of those not on this disk), and opening, selecting, creating,
+renaming and deleting files in Emacs is reported to CodeTracer as its
+own file pane reports them."
+  :type '(choice (const :tag "CodeTracer's file pane" codetracer)
+                 (const :tag "Emacs (dired)" editor)))
 
 (defcustom codetracer-request-timeout 120
   "Seconds to wait for the pane server to answer a request."
@@ -216,7 +228,7 @@ else unstyled."
 (cl-defstruct (codetracer-session (:constructor codetracer--make-session)
                                   (:copier nil))
   "One recording open in the pane server."
-  id trace title mode layout tab graphics realized
+  id trace title mode layout tab graphics realized sources watches
   (panes (make-hash-table :test #'equal))
   position
   (decorations (make-hash-table :test #'equal)))
@@ -265,6 +277,12 @@ Window changes made then are not the user's edits.")
 
 (defvar-local codetracer--server-map nil
   "In a pane buffer, the keymap of the server's bindings.")
+
+(defvar-local codetracer--recorded-path nil
+  "In a buffer holding a recorded source, the source's path.")
+
+(defvar-local codetracer--role nil
+  "In a buffer Emacs fills a CodeTracer role with, the role's name.")
 
 (defvar-local codetracer--image nil
   "In a pane buffer, the image its last `pane/content' carried, or nil.")
@@ -365,6 +383,7 @@ that waited there could run while another waits, out of order."
     ('layout/changed (codetracer--on-layout-changed params))
     ('session/position (codetracer--on-position params))
     ('source/decorations (codetracer--on-decorations params))
+    ('source/show (codetracer--on-source-show params))
     (_ nil)))
 
 ;;;; Sessions and tabs
@@ -417,6 +436,8 @@ that waited there could run while another waits, out of order."
       (setf (codetracer-session-position session) pos)
       (remhash id codetracer--early-positions))
     (setq codetracer--active-session id)
+    (codetracer--fetch-sources session)
+    (codetracer--watch-sources session)
     (codetracer--select-tab session)
     (codetracer--realize session)
     ;; The session's first position arrived with the answer; show it now
@@ -460,6 +481,7 @@ that waited there could run while another waits, out of order."
     (maphash (lambda (_pane buffer) (when (buffer-live-p buffer) (kill-buffer buffer)))
              (codetracer-session-panes session))
     (codetracer--clear-decorations session)
+    (codetracer--unwatch-sources session)
     (remhash id codetracer--sessions)
     (when (equal codetracer--active-session id)
       (setq codetracer--active-session nil))
@@ -584,8 +606,9 @@ side's fraction of the frame across it, PANE-LIST its panes as
     buffer))
 
 (defun codetracer--pane-windows (&optional frame)
-  "The windows of FRAME showing a CodeTracer pane."
-  (cl-remove-if-not (lambda (w) (buffer-local-value 'codetracer--pane (window-buffer w)))
+  "The windows of FRAME showing a CodeTracer pane, or a role Emacs fills."
+  (cl-remove-if-not (lambda (w) (or (buffer-local-value 'codetracer--pane (window-buffer w))
+                                    (buffer-local-value 'codetracer--role (window-buffer w))))
                     (window-list frame 'nomini)))
 
 (defun codetracer--side-axis-size (window side)
@@ -608,7 +631,10 @@ side's fraction of the frame across it, PANE-LIST its panes as
         (dolist (leaf leaves)
           (cl-incf slot)
           (let* ((pane (nth 0 leaf))
-                 (buffer (codetracer--pane-buffer session pane))
+                 (buffer (if (and (equal pane "fileTree")
+                                  (eq codetracer-panels-file-tree 'editor))
+                             (codetracer--file-tree-buffer session)
+                           (codetracer--pane-buffer session pane)))
                  (window (display-buffer
                           buffer
                           `((display-buffer-in-side-window)
@@ -1194,9 +1220,9 @@ window when it is not a side window, else any live window that is not."
 
 (defun codetracer--show-position (session pos)
   "Show SESSION's position POS in its source window and mark the line."
-  (let ((file (plist-get pos :file)))
-    (when (and (stringp file) (file-exists-p file))
-      (let* ((buffer (find-file-noselect file))
+  (let ((buffer (codetracer--source-buffer session (plist-get pos :file))))
+    (when buffer
+      (let* (
              (window (codetracer--source-window session))
              (codetracer--realizing t))
         (set-window-dedicated-p window nil)
@@ -1227,7 +1253,8 @@ window when it is not a side window, else any live window that is not."
 
 (defun codetracer--report-source-viewport (session window)
   "Tell the server the lines visible in SESSION's source WINDOW."
-  (let ((file (buffer-file-name (window-buffer window))))
+  (let ((file (with-current-buffer (window-buffer window)
+                (or codetracer--recorded-path buffer-file-name))))
     (when file
       (with-current-buffer (window-buffer window)
         (let ((first (line-number-at-pos (window-start window)))
@@ -1240,7 +1267,8 @@ window when it is not a side window, else any live window that is not."
 (defun codetracer--on-window-scroll (window _start)
   "When the user scrolls a source WINDOW, report its visible lines."
   (when (and (codetracer--live-p) (not codetracer--realizing)
-             (buffer-file-name (window-buffer window)))
+             (with-current-buffer (window-buffer window)
+               (or codetracer--recorded-path buffer-file-name)))
     (when-let ((session (codetracer--current-tab-session)))
       (when (eq window (codetracer--source-window session))
         (codetracer--report-source-viewport session window)))))
@@ -1299,6 +1327,184 @@ window when it is not a side window, else any live window that is not."
   (maphash (lambda (_k overlays) (mapc #'delete-overlay overlays))
            (codetracer-session-decorations session))
   (clrhash (codetracer-session-decorations session)))
+
+;;;; Panel roles
+
+;; The source editor is always Emacs's own buffers (E7): the source window
+;; reports its cursor (`source/cursor'), which is what an operation "at the
+;; cursor" acts on and how the server learns which file the user opened.
+;; The file tree is CodeTracer's file pane unless `codetracer-panels-file-tree'
+;; gives the role to Emacs: a `dired' listing of the recording's sources then
+;; takes the file pane's place, its selection is reported (`files/selected'),
+;; and the files created, renamed and deleted beside the sources are reported
+;; (`files/changed').  A source that is not on this disk is read from the
+;; recording (`source/read') into a read-only buffer.
+
+(defun codetracer--source-paths (session)
+  "The paths of SESSION's recorded sources."
+  (mapcar (lambda (e) (plist-get e :path)) (codetracer-session-sources session)))
+
+(defun codetracer--recorded-buffer (session path)
+  "A read-only buffer holding SESSION's recorded source PATH.
+For a source that is not on this disk: its text as the recording holds
+it, filled in when the server answers `source/read' (this may run from a
+notification, where a request must not wait)."
+  (let* ((name (format "*codetracer %s: %s*" (codetracer-session-id session)
+                       (file-name-nondirectory path)))
+         (buffer (get-buffer name)))
+    (or buffer
+        (with-current-buffer (get-buffer-create name)
+          ;; The file's own major mode, as visiting it would choose.
+          (let ((buffer-file-name path))
+            (set-auto-mode))
+          (setq-local codetracer--recorded-path path)
+          (setq-local codetracer--pane-session (codetracer-session-id session))
+          (read-only-mode 1)
+          (let ((target (current-buffer)))
+            (codetracer--send :source/read
+                              `(:session ,(codetracer-session-id session) :file ,path)
+                              (lambda (result)
+                                (when (buffer-live-p target)
+                                  (with-current-buffer target
+                                    (let ((inhibit-read-only t)
+                                          (point (point)))
+                                      (erase-buffer)
+                                      (insert (or (plist-get result :text) ""))
+                                      (set-buffer-modified-p nil)
+                                      (goto-char (min point (point-max)))))))))
+          (current-buffer)))))
+
+(defun codetracer--source-buffer (session path)
+  "The buffer to show SESSION's source PATH in: the file, or its recorded text."
+  (cond ((not (stringp path)) nil)
+        ((file-exists-p path) (find-file-noselect path))
+        (t (codetracer--recorded-buffer session path))))
+
+(defun codetracer-sources ()
+  "Open one of the recording's sources, read-only when it is not on this disk."
+  (interactive)
+  (let* ((session (or (codetracer--current-tab-session)
+                      (user-error "This tab shows no CodeTracer session")))
+         (path (completing-read "Recorded source: "
+                                (codetracer--source-paths session) nil t)))
+    (pop-to-buffer-same-window (codetracer--source-buffer session path))))
+
+(defun codetracer--common-directory (files)
+  "The deepest directory holding every one of FILES."
+  (let ((dir (if files (file-name-directory (car files)) default-directory)))
+    (while (and (cl-notevery (lambda (f) (string-prefix-p dir f)) files)
+                (not (equal dir (file-name-directory (directory-file-name dir)))))
+      (setq dir (file-name-directory (directory-file-name dir))))
+    dir))
+
+(defun codetracer--file-tree-name (session)
+  "The name of SESSION's file-tree listing."
+  (format "*codetracer %s: files*" (codetracer-session-id session)))
+
+(defun codetracer--file-tree-buffer (session)
+  "SESSION's `dired' listing of its sources: the file-tree role in Emacs.
+It lists the sources on this disk; `codetracer-sources' offers them all."
+  (let* ((files (cl-remove-if-not #'file-exists-p (codetracer--source-paths session)))
+         (root (codetracer--common-directory files))
+         (old (get-buffer (codetracer--file-tree-name session))))
+    (when old (kill-buffer old))
+    (let ((buffer (dired-noselect (cons root (mapcar (lambda (f) (file-relative-name f root))
+                                                     files)))))
+      (with-current-buffer buffer
+        (rename-buffer (codetracer--file-tree-name session) t)
+        (setq codetracer--role "fileTree"
+              codetracer--pane-session (codetracer-session-id session))
+        (add-hook 'post-command-hook #'codetracer--file-tree-selection nil t))
+      (puthash "fileTree" buffer (codetracer-session-panes session))
+      buffer)))
+
+(defvar-local codetracer--file-tree-selected nil
+  "In a file-tree listing, the file last reported selected.")
+
+(defun codetracer--file-tree-selection ()
+  "Report the file under point in a file-tree listing, when it changed."
+  (when-let* (((codetracer--live-p))
+              (file (ignore-errors (dired-get-filename nil t))))
+    (unless (equal file codetracer--file-tree-selected)
+      (setq codetracer--file-tree-selected file)
+      (codetracer--notify :files/selected `(:session ,codetracer--pane-session
+                                            :path ,file)))))
+
+(defvar codetracer--cursor-sent nil
+  "The (FILE LINE COLUMN) last reported with `source/cursor'.")
+
+(defun codetracer--report-cursor ()
+  "Report the cursor of the selected window when it is in a recorded source."
+  (when-let* (((codetracer--live-p))
+              (session (codetracer--current-tab-session))
+              (file (or codetracer--recorded-path buffer-file-name))
+              ((member file (codetracer--source-paths session))))
+    (let ((at (list file (line-number-at-pos) (1+ (current-column)))))
+      (unless (equal at codetracer--cursor-sent)
+        (setq codetracer--cursor-sent at)
+        (codetracer--notify :source/cursor
+                            `(:session ,(codetracer-session-id session)
+                              :file ,(nth 0 at) :line ,(nth 1 at) :column ,(nth 2 at)))))))
+
+(defun codetracer--watch-sources (session)
+  "Report files created, renamed and deleted beside SESSION's sources.
+Only when Emacs fills the file-tree role: CodeTracer's own pane lists the
+project itself."
+  (when (and (eq codetracer-panels-file-tree 'editor)
+             (null (codetracer-session-watches session)))
+    (let ((dirs (delete-dups
+                 (delq nil (mapcar (lambda (p) (and (file-exists-p p) (file-name-directory p)))
+                                   (codetracer--source-paths session))))))
+      (setf (codetracer-session-watches session)
+            (delq nil (mapcar (lambda (dir)
+                                (ignore-errors
+                                  (file-notify-add-watch
+                                   dir '(change)
+                                   (lambda (event) (codetracer--on-file-event session event)))))
+                              dirs))))))
+
+(defun codetracer--own-file-p (file)
+  "Non-nil when FILE is Emacs's own lock, backup or auto-save file."
+  (let ((name (file-name-nondirectory file)))
+    (or (string-prefix-p ".#" name)
+        (string-suffix-p "~" name)
+        (and (string-prefix-p "#" name) (string-suffix-p "#" name)))))
+
+(defun codetracer--on-file-event (session event)
+  "Report the file EVENT beside SESSION's sources as `files/changed'.
+Emacs's own lock, backup and auto-save files are not the user's files."
+  (let ((id (codetracer-session-id session)))
+    (pcase (and (not (codetracer--own-file-p (nth 2 event))) event)
+      (`(,_ created ,file . ,_)
+       (codetracer--notify :files/changed `(:session ,id :created ,(vector file)
+                                            :deleted [] :renamed [])))
+      (`(,_ deleted ,file . ,_)
+       (codetracer--notify :files/changed `(:session ,id :created [] :deleted ,(vector file)
+                                            :renamed [])))
+      (`(,_ renamed ,file ,new . ,_)
+       (codetracer--notify :files/changed `(:session ,id :created [] :deleted []
+                                            :renamed [(:from ,file :to ,new)]))))))
+
+(defun codetracer--unwatch-sources (session)
+  "Stop watching SESSION's source directories."
+  (mapc #'file-notify-rm-watch (codetracer-session-watches session))
+  (setf (codetracer-session-watches session) nil))
+
+(defun codetracer--fetch-sources (session)
+  "Ask for SESSION's recorded sources and keep them."
+  (setf (codetracer-session-sources session)
+        (append (codetracer--request :session/files
+                                     `(:session ,(codetracer-session-id session)))
+                nil)))
+
+(defun codetracer--on-source-show (params)
+  "Show the file PARAMS names in the source window: a pane opened it."
+  (when-let* ((session (codetracer--session (plist-get params :session)))
+              (buffer (codetracer--source-buffer session (plist-get params :file))))
+    (let ((window (codetracer--source-window session))
+          (codetracer--realizing t))
+      (set-window-dedicated-p window nil)
+      (set-window-buffer window buffer))))
 
 ;;;; Desktop
 
@@ -1377,6 +1583,8 @@ window when it is not a side window, else any live window that is not."
       (setf (codetracer-session-position session) pos)
       (remhash id codetracer--early-positions))
     (setq codetracer--active-session id)
+    (codetracer--fetch-sources session)
+    (codetracer--watch-sources session)
     ;; The restored tab becomes the session's; its name names the new id.
     (let ((codetracer--realizing t))
       (tab-bar-mode 1)
@@ -1413,14 +1621,16 @@ window when it is not a side window, else any live window that is not."
   (add-hook 'window-size-change-functions #'codetracer--schedule-window-change)
   (add-hook 'window-buffer-change-functions #'codetracer--schedule-window-change)
   (add-hook 'window-scroll-functions #'codetracer--on-window-scroll)
-  (add-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected))
+  (add-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
+  (add-hook 'post-command-hook #'codetracer--report-cursor))
 
 (defun codetracer--remove-hooks ()
   "Stop watching windows and tabs."
   (remove-hook 'window-size-change-functions #'codetracer--schedule-window-change)
   (remove-hook 'window-buffer-change-functions #'codetracer--schedule-window-change)
   (remove-hook 'window-scroll-functions #'codetracer--on-window-scroll)
-  (remove-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected))
+  (remove-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
+  (remove-hook 'post-command-hook #'codetracer--report-cursor))
 
 ;;;; Commands most people bind
 

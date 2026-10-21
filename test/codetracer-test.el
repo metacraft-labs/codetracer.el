@@ -156,6 +156,13 @@
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
   "A 1x1 PNG, base64: what a `pane/content' image carries.")
 
+(ert-deftest codetracer-test-own-files-are-not-reported ()
+  :tags '(unit)
+  (should (codetracer--own-file-p "/src/.#main.py"))
+  (should (codetracer--own-file-p "/src/main.py~"))
+  (should (codetracer--own-file-p "/src/#main.py#"))
+  (should-not (codetracer--own-file-p "/src/main.py")))
+
 (ert-deftest codetracer-test-pane-image ()
   "A frame's image is drawn under the pane's rows, and kept across partial updates."
   :tags '(unit)
@@ -531,6 +538,106 @@ ordinary window is left to keep, so window parameters are ignored."
                      (should (> (buffer-size) 0))))))))
        (delete-directory dir t)
        (delete-file notes)))))
+
+;; The scenario helpers below read the transport's own log of what crossed
+;; it (jsonrpc's events buffer), to see what the package sent.
+(defun codetracer-test--sent-p (method needle)
+  "Non-nil when the transport log shows METHOD sent with NEEDLE in it."
+  (with-current-buffer (jsonrpc-events-buffer codetracer--connection)
+    (save-excursion
+      (goto-char (point-min))
+      (cl-loop while (search-forward method nil t)
+               thereis (save-excursion
+                         (search-forward needle (min (point-max) (+ (point) 4000)) t))))))
+
+(defun codetracer-test--wait-sent (method needle)
+  "Wait up to 10 seconds for METHOD with NEEDLE to be sent.
+`read-event' rather than `accept-process-output': file notifications
+reach Lisp as input events, which batch Emacs reads only there."
+  (let ((deadline (+ (float-time) 10)))
+    (while (and (not (codetracer-test--sent-p method needle))
+                (< (float-time) deadline))
+      (read-event nil nil 0.1)))
+  (codetracer-test--sent-p method needle))
+
+(ert-deftest codetracer-test-file-tree-role-filled-by-emacs ()
+  "With the file-tree role given to Emacs, a dired listing takes the file pane's
+place, and what the user does with files is reported as the pane would."
+  :tags '(server)
+  (codetracer-test--with-server
+   (let ((codetracer-panels-file-tree 'editor))
+     (let* ((session (codetracer-open trace))
+            (_ (codetracer-test--settle))
+            (main (plist-get (codetracer-session-position session) :file))
+            (listing (get-buffer (codetracer--file-tree-name session))))
+       (should (member main (codetracer--source-paths session)))
+       ;; The listing is shown where the file pane would be, and lists the source.
+       (should listing)
+       (should (get-buffer-window listing))
+       (with-current-buffer listing
+         (should (derived-mode-p 'dired-mode))
+         (should (dired-goto-file main)))
+       ;; CodeTracer's own file pane is not opened.
+       (should-not (cl-find-if (lambda (b) (and (equal (buffer-local-value 'codetracer--pane b)
+                                                       "fileTree")
+                                                (buffer-local-value 'codetracer--pane-open b)))
+                               (buffer-list)))
+       ;; Selecting the file in the listing is reported (what the listing's
+       ;; `post-command-hook' runs after each command).
+       (with-current-buffer listing
+         (dired-goto-file main)
+         (codetracer--file-tree-selection))
+       (should (codetracer-test--wait-sent "files/selected" main))
+       ;; Opening it: the source window's cursor is reported (what the global
+       ;; `post-command-hook' runs).
+       (with-selected-window (codetracer--source-window session)
+         (find-file main)
+         (goto-char (point-min))
+         (forward-line 2)
+         (setq codetracer--cursor-sent nil)
+         (codetracer--report-cursor))
+       (should (codetracer-test--wait-sent "source/cursor" main))
+       ;; A file created and deleted beside the sources is reported.
+       (let ((probe (expand-file-name "codetracer-el-probe.txt" (file-name-directory main))))
+         (unwind-protect
+             (progn
+               (with-temp-file probe (insert "probe\n"))
+               (should (codetracer-test--wait-sent "files/changed" probe)))
+           (delete-file probe)))))))
+
+(ert-deftest codetracer-test-file-pane-row-opens-the-file ()
+  "A row of CodeTracer's file pane opens its file in Emacs's source window; a
+recorded source is readable, read-only, from the recording."
+  :tags '(server)
+  (codetracer-test--with-server
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (main (plist-get (codetracer-session-position session) :file))
+          (pane (gethash "fileTree" (codetracer-session-panes session)))
+          (source (codetracer--source-window session)))
+     (should (get-buffer-window pane))
+     (set-window-buffer source (get-buffer-create "*elsewhere*"))
+     (with-current-buffer pane
+       (goto-char (point-min))
+       (let ((match (text-property-search-forward
+                     'codetracer-hotspot nil
+                     (lambda (_ v) (and v (equal (car v) "file-tree.open"))))))
+         (should match)
+         (goto-char (prop-match-beginning match))
+         (should (string-suffix-p "main.py" (plist-get (cdr (codetracer--hotspot-at (point)))
+                                                       :path)))
+         (codetracer-activate-hotspot)))
+     (codetracer-test--settle)
+     (should (equal (buffer-file-name (window-buffer source)) main))
+     ;; The recording's text of the same source, as shown for one that is
+     ;; not on this disk: read-only, and the recorded text.
+     (let ((buffer (codetracer--recorded-buffer session main)))
+       (codetracer-test--settle)
+       (with-current-buffer buffer
+         (should buffer-read-only)
+         (should (equal (buffer-string)
+                        (with-temp-buffer (insert-file-contents main) (buffer-string)))))
+       (kill-buffer buffer)))))
 
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here
