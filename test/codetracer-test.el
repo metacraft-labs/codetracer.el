@@ -639,5 +639,84 @@ recorded source is readable, read-only, from the recording."
                         (with-temp-buffer (insert-file-contents main) (buffer-string)))))
        (kill-buffer buffer)))))
 
+(defun codetracer-test--png-size (data)
+  "The (WIDTH . HEIGHT) a PNG's header in DATA declares."
+  (should (string-prefix-p "\x89PNG\r\n\x1a\n" data))
+  (cl-flet ((u32 (at) (+ (ash (aref data at) 24) (ash (aref data (+ at 1)) 16)
+                         (ash (aref data (+ at 2)) 8) (aref data (+ at 3)))))
+    ;; The IHDR chunk follows the 8-byte signature and its 8-byte header.
+    (cons (u32 16) (u32 20))))
+
+(defun codetracer-test--frame-image (buffer)
+  "The image descriptor BUFFER displays, or nil."
+  (with-current-buffer buffer
+    (let ((pos (next-single-property-change (point-min) 'display)))
+      (and pos (get-text-property pos 'display)))))
+
+(ert-deftest codetracer-test-frames-drawn-from-a-real-recording ()
+  "A recording with graphics: its frames arrive as PNGs and Emacs draws each,
+at the size the server reports; the next frame replaces the first.
+Needs CODETRACER_CT_GFX_PLAYER_CMD (the visual replay player, licensed in
+the environment) and CODETRACER_TEST_GFX_STREAM (a gfx stream), as well as
+the variables every scenario needs."
+  :tags '(server)
+  (unless (image-type-available-p 'png)
+    (ert-fail "this Emacs cannot draw PNG images"))
+  (codetracer-test--with-server
+   (let* ((player (codetracer-test--env "CODETRACER_CT_GFX_PLAYER_CMD"))
+          (stream (codetracer-test--env "CODETRACER_TEST_GFX_STREAM"))
+          (gfx-trace (make-temp-file "codetracer-gfx" t))
+          (codetracer-media '("text" "image")))
+     (ignore player)
+     (unwind-protect
+         (progn
+           ;; The recording, given the stream as its graphics.
+           (copy-directory trace gfx-trace nil t t)
+           (copy-directory stream (expand-file-name "gfx_stream" gfx-trace) nil t t)
+           (let ((session (codetracer-open gfx-trace)))
+             (codetracer-test--settle)
+             (should (eq (plist-get (codetracer-session-graphics session) :available) t))
+             (should (codetracer-show-frames))
+             (let* ((buffer (gethash "frameViewer" (codetracer-session-panes session)))
+                    (deadline (+ (float-time) 60)))
+               (while (and (not (codetracer-test--frame-image buffer))
+                           (< (float-time) deadline))
+                 (accept-process-output nil 0.2))
+               (let* ((first (codetracer-test--frame-image buffer))
+                      (spec (buffer-local-value 'codetracer--image-spec buffer)))
+                 (should first)
+                 (should (eq (plist-get (cdr first) :type) 'png))
+                 ;; The image Emacs draws is the frame at the reported size.
+                 (should (equal (codetracer-test--png-size (plist-get (cdr first) :data))
+                                (cons (plist-get spec :width) (plist-get spec :height))))
+                 (should (> (plist-get spec :frameCount) 1))
+                 (should (eql (plist-get spec :frame) 0))
+                 ;; The next frame replaces it.
+                 (codetracer--run "frame-viewer.next-frame"
+                                  :session (codetracer-session-id session))
+                 (let ((deadline (+ (float-time) 60)))
+                   (while (and (eql (plist-get (buffer-local-value 'codetracer--image-spec
+                                                                   buffer)
+                                               :frame)
+                                    0)
+                               (< (float-time) deadline))
+                     (accept-process-output nil 0.2)))
+                 (let ((second (codetracer-test--frame-image buffer))
+                       (spec (buffer-local-value 'codetracer--image-spec buffer)))
+                   (should (eql (plist-get spec :frame) 1))
+                   (should second)
+                   (should-not (equal (plist-get (cdr second) :data)
+                                      (plist-get (cdr first) :data)))
+                   (should (equal (codetracer-test--png-size (plist-get (cdr second) :data))
+                                  (cons (plist-get spec :width) (plist-get spec :height))))
+                   ;; One image in the pane: the previous one is gone.
+                   (with-current-buffer buffer
+                     (let ((images 0) (pos (point-min)))
+                       (while (setq pos (next-single-property-change pos 'display))
+                         (when (eq (car-safe (get-text-property pos 'display)) 'image)
+                           (cl-incf images)))
+                       (should (= images 1)))))))))
+       (delete-directory gfx-trace t)))))
+
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

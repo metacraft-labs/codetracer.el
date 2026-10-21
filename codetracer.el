@@ -287,6 +287,9 @@ Window changes made then are not the user's edits.")
 (defvar-local codetracer--image nil
   "In a pane buffer, the image its last `pane/content' carried, or nil.")
 
+(defvar-local codetracer--image-spec nil
+  "In a pane buffer, the last `pane/content' image: its size and frame.")
+
 (defvar-local codetracer--restored nil
   "In a pane buffer `desktop' restored, what it saved about its session.")
 
@@ -930,7 +933,11 @@ replaces it; otherwise each row replaces the line it indexes."
         (when (zerop (forward-line (max 1 height)))
           (delete-region (1- (point)) (point-max)))
         (when-let ((spec (plist-get params :image)))
-          (setq codetracer--image (codetracer--pane-image spec)))
+          (setq codetracer--image (codetracer--pane-image spec)
+                codetracer--image-spec (list :width (plist-get spec :width)
+                                             :height (plist-get spec :height)
+                                             :frame (plist-get spec :frame)
+                                             :frameCount (plist-get spec :frameCount))))
         (codetracer--insert-image)
         (goto-char (point-min))
         (forward-line (1- line))

@@ -10,6 +10,15 @@
 #                          program is the one the suite is written against)
 #   REPLAY_SERVER_BIN      the replay server, when it is not where
 #                          `codetracer-tui` looks for it by default
+# The frame viewer's case also needs a recording with graphics:
+#   CODETRACER_CT_GFX_PLAYER_CMD  the visual replay player (`ct_gfx_player`),
+#                                 with a licence that allows Visual Replay in
+#                                 its environment (`ct-native-replay license
+#                                 generate-visual-replay-test-license` writes
+#                                 a test one)
+#   CODETRACER_TEST_GFX_STREAM    a gfx stream to give the recording graphics,
+#                                 e.g. codetracer-visual-replay's
+#                                 tests/corpus_phase1/mpv
 # Without them it fails, by design: a suite that skipped would pass with no
 # server at all.
 
