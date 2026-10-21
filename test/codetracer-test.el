@@ -36,6 +36,11 @@
 (require 'ert)
 (require 'codetracer)
 
+(defvar desktop-path)
+(defvar desktop-restore-frames)
+(defvar desktop-load-locked-desktop)
+(defvar desktop-restore-eager)
+
 ;;;; Unit tests
 
 (ert-deftest codetracer-test-emacs-keys ()
@@ -77,12 +82,12 @@
 (ert-deftest codetracer-test-render-row ()
   :tags '(unit)
   (let* ((row '(:index 0 :text "▾ main() => 0"
-                :spans [(:start 0 :end 3 :style "ct.chrome-muted")
-                        (:start 4 :end 8 :style "ct.chrome-text" :bold t)
-                        (:start 13 :end 14 :style "ct.call-return"
-                         :surface "ct.surface-active-row")]
-                :hotspots [(:start 0 :end 3 :operation "calltrace.toggle-call"
-                            :args (:index 0))]))
+                       :spans [(:start 0 :end 3 :style "ct.chrome-muted")
+                               (:start 4 :end 8 :style "ct.chrome-text" :bold t)
+                               (:start 13 :end 14 :style "ct.call-return"
+                                       :surface "ct.surface-active-row")]
+                       :hotspots [(:start 0 :end 3 :operation "calltrace.toggle-call"
+                                          :args (:index 0))]))
          (text (codetracer--render-row row)))
     (should (equal text "▾ main() => 0"))
     (should (memq 'codetracer-chrome-muted (ensure-list (get-text-property 0 'face text))))
@@ -99,18 +104,18 @@
 
 (defconst codetracer-test--layout
   '(:kind "row"
-    :children [(:kind "stack" :activeIndex 0 :weight 28.0
-                :children [(:kind "pane" :pane "fileTree") (:kind "pane" :pane "vcs")])
-               (:kind "pane" :pane "editor" :weight 85.0)
-               (:kind "column" :weight 87.0
-                :children [(:kind "row" :weight 29.0
-                            :children [(:kind "stack" :activeIndex 0 :weight 43.0
-                                        :children [(:kind "pane" :pane "state")])
-                                       (:kind "stack" :activeIndex 0 :weight 44.0
-                                        :children [(:kind "pane" :pane "calltrace")])])
-                           (:kind "stack" :activeIndex 0 :weight 29.0
-                            :children [(:kind "pane" :pane "eventLog")
-                                       (:kind "pane" :pane "terminalOutput")])])])
+          :children [(:kind "stack" :activeIndex 0 :weight 28.0
+                            :children [(:kind "pane" :pane "fileTree") (:kind "pane" :pane "vcs")])
+                     (:kind "pane" :pane "editor" :weight 85.0)
+                     (:kind "column" :weight 87.0
+                            :children [(:kind "row" :weight 29.0
+                                              :children [(:kind "stack" :activeIndex 0 :weight 43.0
+                                                                :children [(:kind "pane" :pane "state")])
+                                                         (:kind "stack" :activeIndex 0 :weight 44.0
+                                                                :children [(:kind "pane" :pane "calltrace")])])
+                                       (:kind "stack" :activeIndex 0 :weight 29.0
+                                              :children [(:kind "pane" :pane "eventLog")
+                                                         (:kind "pane" :pane "terminalOutput")])])])
   "The terminal's debug layout, as the server sends it.")
 
 (defmacro codetracer-test--with-panes (&rest body)
@@ -142,10 +147,64 @@
   :tags '(unit)
   (codetracer-test--with-panes
    (let ((sides (codetracer--sides '(:kind "stack" :activeIndex 1
-                                     :children [(:kind "pane" :pane "state")
-                                                (:kind "pane" :pane "calltrace")]))))
+                                           :children [(:kind "pane" :pane "state")
+                                                      (:kind "pane" :pane "calltrace")]))))
      (should (= (length sides) 1))
      (should (equal (mapcar #'car (nth 2 (car sides))) '("calltrace"))))))
+
+(defconst codetracer-test--png
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+  "A 1x1 PNG, base64: what a `pane/content' image carries.")
+
+(ert-deftest codetracer-test-pane-image ()
+  "A frame's image is drawn under the pane's rows, and kept across partial updates."
+  :tags '(unit)
+  (let ((codetracer--sessions (make-hash-table))
+        (session (codetracer--make-session :id 7 :trace "/t" :title "t")))
+    (puthash 7 session codetracer--sessions)
+    (unwind-protect
+        (progn
+          (codetracer--on-pane-content
+           `(:session 7 :pane "frameViewer" :width 30 :height 2 :full t
+                      :rows [(:index 0 :text "Frame 1 of 3" :spans [])
+                             (:index 1 :text "next" :spans [])]
+                      :image (:mediaType "image/png" :encoding "base64"
+                                         :data ,codetracer-test--png :width 1 :height 1
+                                         :frame 0 :frameCount 3)))
+          (with-current-buffer (gethash "frameViewer" (codetracer-session-panes session))
+            ;; An Emacs without PNG support draws the rows only; the dev
+            ;; shell's Emacs has it, so there the image is checked.
+            (let* ((png (image-type-available-p 'png))
+                   (pos (next-single-property-change (point-min) 'display))
+                   (image (and pos (get-text-property pos 'display))))
+              (if (not png)
+                  (should-not image)
+                (should image)
+                (should (eq (car image) 'image))
+                (should (eq (plist-get (cdr image) :type) 'png))
+                (should (string-prefix-p "\x89PNG" (plist-get (cdr image) :data)))))
+            (should (equal (buffer-substring-no-properties (point-min) (line-end-position))
+                           "Frame 1 of 3"))
+            ;; A partial update replaces its row and keeps the image.
+            (codetracer--on-pane-content
+             '(:session 7 :pane "frameViewer" :width 30 :height 2 :full :json-false
+                        :rows [(:index 0 :text "Frame 2 of 3" :spans [])]))
+            (goto-char (point-min))
+            (should (equal (buffer-substring-no-properties (point-min) (line-end-position))
+                           "Frame 2 of 3"))
+            (when (image-type-available-p 'png)
+              (should (= (count-lines (point-min) (point-max)) 3))
+              (should (next-single-property-change (point-min) 'display)))))
+      (maphash (lambda (_ b) (kill-buffer b)) (codetracer-session-panes session)))))
+
+(ert-deftest codetracer-test-media-declaration ()
+  "Images are declared when this Emacs can display them, or when asked for."
+  :tags '(unit)
+  (let ((codetracer-media nil))
+    (should (equal (codetracer--media)
+                   (if (display-images-p) '("text" "image") '("text")))))
+  (let ((codetracer-media '("text" "image")))
+    (should (equal (codetracer--media) '("text" "image")))))
 
 ;;;; Scenario tests against a real pane server
 
@@ -182,6 +241,20 @@ all of them."
   "The window showing SESSION's PANE, or nil."
   (get-buffer-window (gethash pane (codetracer-session-panes session))))
 
+(defun codetracer-test--reset-windows ()
+  "One tab, one ordinary window, whatever the last test left.
+`desktop' may have restored a window configuration in which no
+ordinary window is left to keep, so window parameters are ignored."
+  (ignore-errors (tab-bar-close-other-tabs))
+  (let ((ignore-window-parameters t))
+    (delete-other-windows
+     (or (cl-find-if-not (lambda (w) (window-parameter w 'window-side))
+                         (window-list nil 'nomini))
+         (selected-window))))
+  (set-window-parameter (selected-window) 'window-side nil)
+  (set-window-parameter (selected-window) 'window-slot nil)
+  (set-window-dedicated-p (selected-window) nil))
+
 (defmacro codetracer-test--with-server (&rest body)
   "Run BODY with a pane server started and torn down around it."
   (declare (indent 0))
@@ -191,182 +264,273 @@ all of them."
          (codetracer-pane-user-maps nil))
      (ignore trace)
      (set-frame-size (selected-frame) 200 60)
-     (delete-other-windows)
+     (codetracer-test--reset-windows)
      (unwind-protect
          (progn ,@body)
        (ignore-errors (codetracer-quit))
        (let ((deadline (+ (float-time) 10)))
          (while (and (codetracer--live-p) (< (float-time) deadline))
            (accept-process-output nil 0.1)))
-       (ignore-errors (tab-bar-close-other-tabs))
-       (delete-other-windows))))
+       (codetracer-test--reset-windows))))
 
 (ert-deftest codetracer-test-layouts-per-mode ()
   "Each mode's layout is realized in side windows; a mode switch re-arranges them."
   :tags '(server)
   (codetracer-test--with-server
-    (let ((session (codetracer-open trace)))
-      (codetracer-test--settle)
-      (should (equal (codetracer-session-mode session) "debug"))
-      (let ((debug-panes (codetracer-test--shown-panes)))
-        (should (equal debug-panes (codetracer-test--expected-panes session)))
-        (should (member "calltrace" debug-panes))
-        ;; Every shown pane was opened at its window's size and drawn there.
-        (dolist (w (codetracer--pane-windows))
-          (with-current-buffer (window-buffer w)
-            (should codetracer--pane-open)
-            (should (equal codetracer--pane-size
-                           (cons (window-body-width w) (window-body-height w))))))
-        (with-current-buffer (gethash "calltrace" (codetracer-session-panes session))
-          (should (> (buffer-size) 0)))
-        ;; The user's source window is kept.
-        (should (cl-find-if-not (lambda (w) (window-parameter w 'window-side))
-                                (window-list nil 'nomini)))
-        (codetracer-toggle-mode)
-        (codetracer-test--settle)
-        (should (equal (codetracer-session-mode session) "edit"))
-        (let ((edit-panes (codetracer-test--shown-panes)))
-          (should (equal edit-panes (codetracer-test--expected-panes session)))
-          (should-not (equal edit-panes debug-panes)))
-        (codetracer-toggle-mode)
-        (codetracer-test--settle)
-        (should (equal (codetracer-session-mode session) "debug"))
-        (should (equal (codetracer-test--shown-panes) debug-panes))))))
+   (let ((session (codetracer-open trace)))
+     (codetracer-test--settle)
+     (should (equal (codetracer-session-mode session) "debug"))
+     (let ((debug-panes (codetracer-test--shown-panes)))
+       (should (equal debug-panes (codetracer-test--expected-panes session)))
+       (should (member "calltrace" debug-panes))
+       ;; Every shown pane was opened at its window's size and drawn there.
+       (dolist (w (codetracer--pane-windows))
+         (with-current-buffer (window-buffer w)
+           (should codetracer--pane-open)
+           (should (equal codetracer--pane-size
+                          (cons (window-body-width w) (window-body-height w))))))
+       (with-current-buffer (gethash "calltrace" (codetracer-session-panes session))
+         (should (> (buffer-size) 0)))
+       ;; The user's source window is kept.
+       (should (cl-find-if-not (lambda (w) (window-parameter w 'window-side))
+                               (window-list nil 'nomini)))
+       (codetracer-toggle-mode)
+       (codetracer-test--settle)
+       (should (equal (codetracer-session-mode session) "edit"))
+       (let ((edit-panes (codetracer-test--shown-panes)))
+         (should (equal edit-panes (codetracer-test--expected-panes session)))
+         (should-not (equal edit-panes debug-panes)))
+       (codetracer-toggle-mode)
+       (codetracer-test--settle)
+       (should (equal (codetracer-session-mode session) "debug"))
+       (should (equal (codetracer-test--shown-panes) debug-panes))))))
 
 (ert-deftest codetracer-test-step-updates-position-and-panes ()
   "A step moves the source window and the execution mark, and redraws the panes."
   :tags '(server)
   (codetracer-test--with-server
-    (let* ((session (codetracer-open trace))
-           (_ (codetracer-test--settle))
-           (before (codetracer-session-position session))
-           (state (gethash "state" (codetracer-session-panes session)))
-           (state-before (with-current-buffer state (buffer-string))))
-      (should before)
-      (let ((source (codetracer--source-window session)))
-        (should (equal (buffer-file-name (window-buffer source)) (plist-get before :file)))
-        (with-current-buffer (window-buffer source)
-          (should (= (line-number-at-pos (window-point source)) (plist-get before :line)))))
-      (codetracer-step-over)
-      (codetracer-test--settle)
-      (let ((after (codetracer-session-position session)))
-        (should (> (plist-get after :tick) (plist-get before :tick)))
-        (let ((source (codetracer--source-window session)))
-          (with-current-buffer (window-buffer source)
-            (should (= (line-number-at-pos (window-point source)) (plist-get after :line)))
-            ;; The execution mark is on the new line, and only there.
-            (let ((marks (cl-remove-if-not
-                          (lambda (ov) (eq (overlay-get ov 'face) 'codetracer-execution-line))
-                          (overlays-in (point-min) (point-max)))))
-              (should (= (length marks) 1))
-              (should (= (line-number-at-pos (overlay-start (car marks)))
-                         (plist-get after :line)))))))
-      (should-not (equal (with-current-buffer state (buffer-string)) state-before)))))
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (before (codetracer-session-position session))
+          (state (gethash "state" (codetracer-session-panes session)))
+          (state-before (with-current-buffer state (buffer-string))))
+     (should before)
+     (let ((source (codetracer--source-window session)))
+       (should (equal (buffer-file-name (window-buffer source)) (plist-get before :file)))
+       (with-current-buffer (window-buffer source)
+         (should (= (line-number-at-pos (window-point source)) (plist-get before :line)))))
+     (codetracer-step-over)
+     (codetracer-test--settle)
+     (let ((after (codetracer-session-position session)))
+       (should (> (plist-get after :tick) (plist-get before :tick)))
+       (let ((source (codetracer--source-window session)))
+         (with-current-buffer (window-buffer source)
+           (should (= (line-number-at-pos (window-point source)) (plist-get after :line)))
+           ;; The execution mark is on the new line, and only there.
+           (let ((marks (cl-remove-if-not
+                         (lambda (ov) (eq (overlay-get ov 'face) 'codetracer-execution-line))
+                         (overlays-in (point-min) (point-max)))))
+             (should (= (length marks) 1))
+             (should (= (line-number-at-pos (overlay-start (car marks)))
+                        (plist-get after :line)))))))
+     (should-not (equal (with-current-buffer state (buffer-string)) state-before)))))
 
 (ert-deftest codetracer-test-resize-changes-request-window ()
   "A pane window's new size reaches the server, which redraws at that size."
   :tags '(server)
   (codetracer-test--with-server
-    (let* ((session (codetracer-open trace))
-           (_ (codetracer-test--settle))
-           (window (codetracer-test--pane-window session "calltrace"))
-           (height (window-body-height window)))
-      (should (> height 6))
-      (window-resize window -4)
-      (should (= (window-body-height window) (- height 4)))
-      (codetracer--on-window-size-change (selected-frame))
-      (codetracer-test--settle)
-      (with-current-buffer (window-buffer window)
-        (should (equal codetracer--pane-size (cons (window-body-width window) (- height 4))))
-        ;; The pane holds exactly the rows that fit.
-        (should (= (count-lines (point-min) (point-max)) (- height 4)))))))
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (window (codetracer-test--pane-window session "calltrace"))
+          (height (window-body-height window)))
+     (should (> height 6))
+     (window-resize window -4)
+     (should (= (window-body-height window) (- height 4)))
+     (codetracer--on-window-size-change (selected-frame))
+     (codetracer-test--settle)
+     (with-current-buffer (window-buffer window)
+       (should (equal codetracer--pane-size (cons (window-body-width window) (- height 4))))
+       ;; The pane holds exactly the rows that fit.
+       (should (= (count-lines (point-min) (point-max)) (- height 4)))))))
 
 (ert-deftest codetracer-test-user-binding-shadows-codetracer-keymap ()
   "Your binding in a pane wins over CodeTracer's, and the server is told."
   :tags '(server)
   (codetracer-test--with-server
-    (let* ((session (codetracer-open trace))
-           (_ (codetracer-test--settle))
-           (buffer (gethash "calltrace" (codetracer-session-panes session)))
-           (theirs (with-current-buffer buffer (key-binding (kbd "<down>")))))
-      ;; CodeTracer binds Down in the call trace.
-      (should (get theirs 'codetracer-operation))
-      (keymap-set codetracer-pane-user-map "<down>" #'ignore)
-      (codetracer-report-user-bindings)
-      (codetracer-test--settle)
-      (with-current-buffer buffer
-        (should (eq (key-binding (kbd "<down>")) #'ignore)))
-      ;; The server's keymap now says the editor holds that key.
-      (let ((keymap (codetracer--request :pane/keymap
-                                         `(:session ,(codetracer-session-id session)
-                                           :pane "calltrace"))))
-        (should (cl-find-if (lambda (b) (and (equal (plist-get b :key) "Down")
-                                             (equal (plist-get b :shadowedBy) "editor")))
-                            (plist-get keymap :bindings))))
-      ;; Unbinding it gives the key back.
-      (keymap-unset codetracer-pane-user-map "<down>" t)
-      (codetracer-report-user-bindings)
-      (codetracer-test--settle)
-      (with-current-buffer buffer
-        (should (get (key-binding (kbd "<down>")) 'codetracer-operation))))))
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (buffer (gethash "calltrace" (codetracer-session-panes session)))
+          (theirs (with-current-buffer buffer (key-binding (kbd "<down>")))))
+     ;; CodeTracer binds Down in the call trace.
+     (should (get theirs 'codetracer-operation))
+     (keymap-set codetracer-pane-user-map "<down>" #'ignore)
+     (codetracer-report-user-bindings)
+     (codetracer-test--settle)
+     (with-current-buffer buffer
+       (should (eq (key-binding (kbd "<down>")) #'ignore)))
+     ;; The server's keymap now says the editor holds that key.
+     (let ((keymap (codetracer--request :pane/keymap
+                                        `(:session ,(codetracer-session-id session)
+                                                   :pane "calltrace"))))
+       (should (cl-find-if (lambda (b) (and (equal (plist-get b :key) "Down")
+                                            (equal (plist-get b :shadowedBy) "editor")))
+                           (plist-get keymap :bindings))))
+     ;; Unbinding it gives the key back.
+     (keymap-unset codetracer-pane-user-map "<down>" t)
+     (codetracer-report-user-bindings)
+     (codetracer-test--settle)
+     (with-current-buffer buffer
+       (should (get (key-binding (kbd "<down>")) 'codetracer-operation))))))
 
 (ert-deftest codetracer-test-resize-survives-mode-round-trip ()
   "The user's pane sizes are the mode's layout: they come back with the mode."
   :tags '(server)
   (codetracer-test--with-server
-    (let* ((session (codetracer-open trace))
-           (_ (codetracer-test--settle))
-           (window (codetracer-test--pane-window session "calltrace")))
-      (window-resize window 5)
-      (let ((resized (window-total-height window))
-            (others (mapcar (lambda (p) (cons p (window-total-height
-                                                  (codetracer-test--pane-window session p))))
-                            '("state" "eventLog"))))
-        (codetracer--on-window-size-change (selected-frame))
-        (codetracer-test--settle)
-        (codetracer-toggle-mode)
-        (codetracer-test--settle)
-        (codetracer-toggle-mode)
-        (codetracer-test--settle)
-        (let ((window (codetracer-test--pane-window session "calltrace")))
-          (should window)
-          (should (<= (abs (- (window-total-height window) resized)) 1))
-          (dolist (o others)
-            (should (<= (abs (- (window-total-height
-                                 (codetracer-test--pane-window session (car o)))
-                                (cdr o)))
-                        1))))))))
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (window (codetracer-test--pane-window session "calltrace")))
+     (window-resize window 5)
+     (let ((resized (window-total-height window))
+           (others (mapcar (lambda (p) (cons p (window-total-height
+                                                (codetracer-test--pane-window session p))))
+                           '("state" "eventLog"))))
+       (codetracer--on-window-size-change (selected-frame))
+       (codetracer-test--settle)
+       (codetracer-toggle-mode)
+       (codetracer-test--settle)
+       (codetracer-toggle-mode)
+       (codetracer-test--settle)
+       (let ((window (codetracer-test--pane-window session "calltrace")))
+         (should window)
+         (should (<= (abs (- (window-total-height window) resized)) 1))
+         (dolist (o others)
+           (should (<= (abs (- (window-total-height
+                                (codetracer-test--pane-window session (car o)))
+                               (cdr o)))
+                       1))))))))
 
 (ert-deftest codetracer-test-switching-sessions-shows-their-layouts ()
   "Each session has its tab; selecting it shows that session's layout."
   :tags '(server)
   (codetracer-test--with-server
-    (let* ((first (codetracer-open trace))
-           (_ (codetracer-test--settle))
-           (first-panes (codetracer-test--shown-panes))
-           (second (codetracer-open trace)))
-      (codetracer-test--settle)
-      (should-not (eql (codetracer-session-id first) (codetracer-session-id second)))
-      (should (= (length (tab-bar-tabs)) 3))
-      ;; The second session goes to its edit mode; the first stays in debug.
-      (codetracer-toggle-mode)
-      (codetracer-test--settle)
-      (should (equal (codetracer-session-mode second) "edit"))
-      (let ((second-panes (codetracer-test--shown-panes)))
-        (should-not (equal second-panes first-panes))
-        (codetracer-switch-session (codetracer-session-id first))
-        (codetracer-test--settle)
-        (should (eq (codetracer--current-tab-session) first))
-        (should (eql codetracer--active-session (codetracer-session-id first)))
-        (should (equal (codetracer-test--shown-panes) first-panes))
-        (should (equal (codetracer-session-mode first) "debug"))
-        ;; Its panes are its own buffers.
-        (dolist (w (codetracer--pane-windows))
-          (should (eql (buffer-local-value 'codetracer--pane-session (window-buffer w))
-                       (codetracer-session-id first))))
-        (codetracer-switch-session (codetracer-session-id second))
-        (codetracer-test--settle)
-        (should (equal (codetracer-test--shown-panes) second-panes))))))
+   (let* ((first (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (first-panes (codetracer-test--shown-panes))
+          (second (codetracer-open trace)))
+     (codetracer-test--settle)
+     (should-not (eql (codetracer-session-id first) (codetracer-session-id second)))
+     (should (= (length (tab-bar-tabs)) 3))
+     ;; The second session goes to its edit mode; the first stays in debug.
+     (codetracer-toggle-mode)
+     (codetracer-test--settle)
+     (should (equal (codetracer-session-mode second) "edit"))
+     (let ((second-panes (codetracer-test--shown-panes)))
+       (should-not (equal second-panes first-panes))
+       (codetracer-switch-session (codetracer-session-id first))
+       (codetracer-test--settle)
+       (should (eq (codetracer--current-tab-session) first))
+       (should (eql codetracer--active-session (codetracer-session-id first)))
+       (should (equal (codetracer-test--shown-panes) first-panes))
+       (should (equal (codetracer-session-mode first) "debug"))
+       ;; Its panes are its own buffers.
+       (dolist (w (codetracer--pane-windows))
+         (should (eql (buffer-local-value 'codetracer--pane-session (window-buffer w))
+                      (codetracer-session-id first))))
+       (codetracer-switch-session (codetracer-session-id second))
+       (codetracer-test--settle)
+       (should (equal (codetracer-test--shown-panes) second-panes))))))
+
+(ert-deftest codetracer-test-image-medium-declared ()
+  "The server is told this Emacs takes images, and answers that it will send them."
+  :tags '(server)
+  (codetracer-test--with-server
+   (let ((codetracer-media '("text" "image")))
+     (let ((session (codetracer-open trace)))
+       (codetracer-test--settle)
+       (should (member "image" (append (plist-get (plist-get codetracer--server-info
+                                                             :capabilities)
+                                                  :media)
+                                       nil)))
+       (should (member "frameViewer" (append (plist-get (plist-get codetracer--server-info
+                                                                   :capabilities)
+                                                        :panes)
+                                             nil)))
+       ;; The `calc' recording carries no graphics: the frames command says so.
+       (should-not (eq (plist-get (codetracer-session-graphics session) :available) t))
+       (should-error (codetracer-show-frames) :type 'user-error)))))
+
+(ert-deftest codetracer-test-desktop-keeps-the-arrangement ()
+  "`desktop' restores the panes, their windows and the user's own; they reconnect."
+  :tags '(server)
+  (require 'desktop)
+  (codetracer-test--with-server
+   (let* ((dir (make-temp-file "codetracer-desktop" t))
+          (notes (let ((f (make-temp-file "codetracer-notes" nil ".txt")))
+                   (with-temp-file f (insert "my notes\n"))
+                   f))
+          (desktop-path (list dir))
+          (desktop-restore-frames t)
+          (desktop-load-locked-desktop t)
+          (desktop-restore-eager t)
+          (session (codetracer-open trace)))
+     (unwind-protect
+         (progn
+           (codetracer-test--settle)
+           (codetracer-toggle-mode)
+           (codetracer-test--settle)
+           (should (equal (codetracer-session-mode session) "edit"))
+           ;; The user's own window beside ours, and a pane they resized.
+           (let ((user-window (split-window (codetracer--source-window session) nil 'below)))
+             (set-window-buffer user-window (find-file-noselect notes)))
+           (let* ((panes (codetracer-test--shown-panes))
+                  (pane (car panes))
+                  (window (codetracer-test--pane-window session pane)))
+             (ignore-errors (window-resize window 3))
+             (codetracer--on-window-size-change (selected-frame))
+             (codetracer-test--settle)
+             (let ((sizes (mapcar (lambda (p) (cons p (window-total-height
+                                                       (codetracer-test--pane-window session p))))
+                                  panes)))
+               (cl-letf (((symbol-function 'yes-or-no-p) #'always))
+                 (desktop-save dir t))
+               ;; Everything goes, as when Emacs exits.
+               (codetracer-quit)
+               (let ((deadline (+ (float-time) 10)))
+                 (while (and (codetracer--live-p) (< (float-time) deadline))
+                   (accept-process-output nil 0.1)))
+               (dolist (b (buffer-list))
+                 (when (or (buffer-local-value 'codetracer--pane b)
+                           (equal (buffer-file-name b) notes))
+                   (kill-buffer b)))
+               (tab-bar-close-other-tabs)
+               (delete-other-windows)
+               (should-not (codetracer-test--shown-panes))
+               ;; `desktop-read' does nothing in batch Emacs unless told
+               ;; otherwise; it is the same call a starting Emacs makes.
+               (let ((noninteractive nil))
+                 (should (desktop-read dir)))
+               (codetracer-test--settle)
+               (let ((restored (codetracer--current-tab-session)))
+                 (should restored)
+                 (should (equal (codetracer-session-trace restored) (expand-file-name trace)))
+                 (should (equal (codetracer-session-mode restored) "edit"))
+                 ;; The same panes, in the same windows, at the same sizes.
+                 (should (equal (codetracer-test--shown-panes) panes))
+                 (dolist (s sizes)
+                   (should (<= (abs (- (window-total-height
+                                        (codetracer-test--pane-window restored (car s)))
+                                       (cdr s)))
+                               1)))
+                 ;; The user's window is still there.
+                 (should (get-buffer-window (find-buffer-visiting notes)))
+                 ;; The panes are live again: open on the server, drawn.
+                 (dolist (w (codetracer--pane-windows))
+                   (with-current-buffer (window-buffer w)
+                     (should codetracer--pane-open)
+                     (should (eql codetracer--pane-session (codetracer-session-id restored)))
+                     (should (> (buffer-size) 0))))))))
+       (delete-directory dir t)
+       (delete-file notes)))))
 
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

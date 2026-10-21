@@ -29,8 +29,9 @@
         { pkgs, config, ... }:
         let
           # Emacs 29 is the oldest release the package supports (its
-          # `Package-Requires'); the dev shell uses the current one.
-          emacs = pkgs.emacs-nox;
+          # `Package-Requires'); the dev shell uses the current one, built
+          # with its image libraries so the frame viewer's images are tested.
+          emacs = pkgs.emacs;
         in
         {
           # The mcl-standard-hooks set is installed by the imported git-hooks

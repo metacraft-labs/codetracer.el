@@ -59,6 +59,9 @@
 (require 'tab-bar)
 (require 'subr-x)
 
+(defvar desktop-save-buffer)
+(defvar desktop-buffer-mode-handlers)
+
 (defgroup codetracer nil
   "CodeTracer, the time-traveling debugger, in Emacs."
   :group 'tools
@@ -83,9 +86,16 @@
   "Seconds to wait for the pane server to answer a request."
   :type 'number)
 
-(defcustom codetracer-media '("text")
-  "The media this Emacs offers the pane server for values (`initialize')."
-  :type '(repeat string))
+(defcustom codetracer-media nil
+  "The media this Emacs takes from the pane server (`initialize').
+Nil means all it can draw: text, and images when `display-images-p'."
+  :type '(choice (const :tag "All this Emacs can draw" nil)
+                 (repeat string)))
+
+(defun codetracer--media ()
+  "The media to declare at `initialize'."
+  (or codetracer-media
+      (if (display-images-p) '("text" "image") '("text"))))
 
 ;;;; Faces
 
@@ -206,7 +216,7 @@ else unstyled."
 (cl-defstruct (codetracer-session (:constructor codetracer--make-session)
                                   (:copier nil))
   "One recording open in the pane server."
-  id trace title mode layout tab
+  id trace title mode layout tab graphics realized
   (panes (make-hash-table :test #'equal))
   position
   (decorations (make-hash-table :test #'equal)))
@@ -256,6 +266,12 @@ Window changes made then are not the user's edits.")
 (defvar-local codetracer--server-map nil
   "In a pane buffer, the keymap of the server's bindings.")
 
+(defvar-local codetracer--image nil
+  "In a pane buffer, the image its last `pane/content' carried, or nil.")
+
+(defvar-local codetracer--restored nil
+  "In a pane buffer `desktop' restored, what it saved about its session.")
+
 ;;;; Transport
 
 (defun codetracer--live-p ()
@@ -272,6 +288,19 @@ Window changes made then are not the user's edits.")
   "Send METHOD with PARAMS to the pane server and return its result."
   (jsonrpc-request (codetracer--connection) method (or params '())
                    :timeout codetracer-request-timeout))
+
+(defun codetracer--send (method &optional params on-result)
+  "Send METHOD with PARAMS without waiting; ON-RESULT receives its result.
+For requests made from notification handlers, hooks and timers:
+`jsonrpc' dispatches the server's messages from timers, and a request
+that waited there could run while another waits, out of order."
+  (when (codetracer--live-p)
+    (jsonrpc-async-request codetracer--connection method (or params '())
+                           :success-fn (or on-result #'ignore)
+                           :error-fn (lambda (err)
+                                       (message "CodeTracer: %s failed: %s"
+                                                method (plist-get err :message)))
+                           :timeout codetracer-request-timeout)))
 
 (defun codetracer--notify (method &optional params)
   "Send the notification METHOD with PARAMS to the pane server."
@@ -301,8 +330,8 @@ Window changes made then are not the user's edits.")
     (let ((info (codetracer--request
                  :initialize
                  `(:capabilities
-                   (:media ,(vconcat codetracer-media)
-                    :tabs t :mouseResize t)
+                   (:media ,(vconcat (codetracer--media))
+                           :tabs t :mouseResize t)
                    :keymapOverrides ,(codetracer--overrides-vector)))))
       (unless (eql (plist-get info :protocolVersion) codetracer-protocol-version)
         (jsonrpc-shutdown codetracer--connection)
@@ -381,7 +410,8 @@ Window changes made then are not the user's edits.")
                    :title (file-name-nondirectory
                            (directory-file-name (expand-file-name trace)))
                    :mode (plist-get result :mode)
-                   :layout (plist-get result :layout))))
+                   :layout (plist-get result :layout)
+                   :graphics (plist-get result :graphics))))
     (puthash id session codetracer--sessions)
     (when-let ((pos (gethash id codetracer--early-positions)))
       (setf (codetracer-session-position session) pos)
@@ -411,8 +441,8 @@ Window changes made then are not the user's edits.")
   "Tell the server SESSION is the one shown; it answers with its layout."
   (unless (eql codetracer--active-session (codetracer-session-id session))
     (setq codetracer--active-session (codetracer-session-id session))
-    (codetracer--request :session/activate
-                         `(:session ,(codetracer-session-id session)))))
+    (codetracer--send :session/activate
+                      `(:session ,(codetracer-session-id session)))))
 
 (defun codetracer--on-tab-selected (_previous _current)
   "Make the session whose tab the user selected the active one."
@@ -548,7 +578,8 @@ side's fraction of the frame across it, PANE-LIST its panes as
       (with-current-buffer buffer
         (codetracer-pane-mode)
         (setq codetracer--pane pane
-              codetracer--pane-session (codetracer-session-id session)))
+              codetracer--pane-session (codetracer-session-id session))
+        (setq-local desktop-save-buffer #'codetracer--desktop-buffer-misc))
       (puthash pane buffer (codetracer-session-panes session)))
     buffer))
 
@@ -563,6 +594,7 @@ side's fraction of the frame across it, PANE-LIST its panes as
 
 (defun codetracer--realize (session)
   "Show SESSION's layout in the selected frame, in side windows."
+  (setf (codetracer-session-realized session) (codetracer-session-layout session))
   (let ((codetracer--realizing t)
         (sides (codetracer--sides (codetracer-session-layout session)))
         (shown nil))
@@ -597,9 +629,9 @@ side's fraction of the frame across it, PANE-LIST its panes as
                           (not (get-buffer-window buffer)))
                  (with-current-buffer buffer (setq codetracer--pane-open nil
                                                    codetracer--pane-size nil))
-                 (codetracer--request :pane/close
-                                      `(:session ,(codetracer-session-id session)
-                                        :pane ,pane))))
+                 (codetracer--send :pane/close
+                                   `(:session ,(codetracer-session-id session)
+                                              :pane ,pane))))
              (codetracer-session-panes session))
     (dolist (entry shown)
       (codetracer--sync-pane-size (car entry) 'open))
@@ -629,6 +661,25 @@ side's fraction of the frame across it, PANE-LIST its panes as
     (setf (codetracer-session-mode session) (plist-get params :mode)
           (codetracer-session-layout session) (plist-get params :layout))
     (when (eq (codetracer--current-tab-session) session)
+      (codetracer--show-layout session))))
+
+(defun codetracer--session-windows (session)
+  "The selected frame's windows showing one of SESSION's panes."
+  (cl-remove-if-not
+   (lambda (w) (eql (buffer-local-value 'codetracer--pane-session (window-buffer w))
+                    (codetracer-session-id session)))
+   (codetracer--pane-windows)))
+
+(defun codetracer--show-layout (session)
+  "Show SESSION's layout in its tab, keeping the user's arrangement.
+When the tab already shows the layout last realized there (a tab the
+user returned to, or one `desktop' restored), its windows are the
+user's and stay; the server is told their sizes.  Otherwise the layout
+is realized."
+  (let ((windows (codetracer--session-windows session)))
+    (if (and windows (equal (codetracer-session-realized session)
+                            (codetracer-session-layout session)))
+        (dolist (w windows) (codetracer--sync-pane-size w 'open))
       (codetracer--realize session))))
 
 (defun codetracer--report-layout (session)
@@ -663,32 +714,35 @@ side's fraction of the frame across it, PANE-LIST its panes as
            (main (window-main-window)))
       (when (and editor main (member (codetracer--node-kind layout) '("row" "column")))
         (push `(:path ,(vector editor)
-                :weight ,(if (equal (codetracer--node-kind layout) "row")
-                             (window-total-width main)
-                           (window-total-height main)))
+                      :weight ,(if (equal (codetracer--node-kind layout) "row")
+                                   (window-total-width main)
+                                 (window-total-height main)))
               weights)))
-    (let ((result (codetracer--request
-                   :layout/edited
-                   `(:session ,(codetracer-session-id session)
-                     :mode ,(codetracer-session-mode session)
-                     :sizes ,(apply #'append (mapcar (lambda (c) (list (car c) (cdr c)))
-                                                     sizes))
-                     :weights ,(vconcat weights)
-                     :closed []))))
-      (when-let ((layout (plist-get result :layout)))
-        (setf (codetracer-session-layout session) layout)))))
+    (codetracer--send :layout/edited
+                      `(:session ,(codetracer-session-id session)
+                                 :mode ,(codetracer-session-mode session)
+                                 :sizes ,(apply #'append (mapcar (lambda (c) (list (car c) (cdr c)))
+                                                                 sizes))
+                                 :weights ,(vconcat weights)
+                                 :closed [])
+                      (lambda (result) (codetracer--edited session result)))))
+
+(defun codetracer--edited (session result)
+  "Take the layout RESULT the server recorded for SESSION's user edit.
+It is the arrangement on screen, so it is also the one realized."
+  (when-let ((layout (plist-get result :layout)))
+    (setf (codetracer-session-layout session) layout
+          (codetracer-session-realized session) layout)))
 
 (defun codetracer--report-closed (session pane)
   "Report that the user closed SESSION's PANE."
-  (let ((result (codetracer--request
-                 :layout/edited
-                 `(:session ,(codetracer-session-id session)
-                   :mode ,(codetracer-session-mode session)
-                   :closed ,(vector pane)))))
-    (when-let ((layout (plist-get result :layout)))
-      (setf (codetracer-session-layout session) layout))
-    (codetracer--request :pane/close `(:session ,(codetracer-session-id session)
-                                       :pane ,pane))))
+  (codetracer--send :layout/edited
+                    `(:session ,(codetracer-session-id session)
+                               :mode ,(codetracer-session-mode session)
+                               :closed ,(vector pane))
+                    (lambda (result) (codetracer--edited session result)))
+  (codetracer--send :pane/close `(:session ,(codetracer-session-id session)
+                                           :pane ,pane)))
 
 ;;;; Pane sizes
 
@@ -705,10 +759,10 @@ With OPEN, the pane is opened rather than resized."
             (let ((method (if codetracer--pane-open :pane/resize :pane/open)))
               (setq codetracer--pane-size size
                     codetracer--pane-open t)
-              (codetracer--request method
-                                   `(:session ,codetracer--pane-session
-                                     :pane ,codetracer--pane
-                                     :width ,(car size) :height ,(cdr size))))))))))
+              (codetracer--send method
+                                `(:session ,codetracer--pane-session
+                                           :pane ,codetracer--pane
+                                           :width ,(car size) :height ,(cdr size))))))))))
 
 (defun codetracer--schedule-window-change (frame)
   "Report what happened to FRAME's windows once redisplay is done."
@@ -811,9 +865,9 @@ your own (`codetracer-pane-user-map', `codetracer-pane-user-maps') first."
           (add-text-properties
            start end
            `(codetracer-hotspot (,(plist-get spot :operation) . ,(plist-get spot :args))
-             mouse-face highlight
-             keymap ,codetracer-hotspot-map
-             help-echo ,(format "%s" (plist-get spot :operation)))
+                                mouse-face highlight
+                                keymap ,codetracer-hotspot-map
+                                help-echo ,(format "%s" (plist-get spot :operation)))
            text))))
     text))
 
@@ -844,13 +898,39 @@ replaces it; otherwise each row replaces the line it indexes."
                 (insert (make-string missing ?\n))))
             (delete-region (point) (line-end-position))
             (insert (codetracer--render-row row))))
-        ;; Lines past the height the server drew at are gone.
+        ;; Lines past the height the server drew at are gone, and so is the
+        ;; image under them, which is drawn again below.
         (goto-char (point-min))
         (when (zerop (forward-line (max 1 height)))
           (delete-region (1- (point)) (point-max)))
+        (when-let ((spec (plist-get params :image)))
+          (setq codetracer--image (codetracer--pane-image spec)))
+        (codetracer--insert-image)
         (goto-char (point-min))
         (forward-line (1- line))
         (move-to-column column)))))
+
+(defun codetracer--pane-image (spec)
+  "The image `pane/content' SPEC carries, as an image descriptor, or nil."
+  (when (and spec (equal (plist-get spec :encoding) "base64"))
+    (let ((data (base64-decode-string (plist-get spec :data)))
+          (type (pcase (plist-get spec :mediaType)
+                  ("image/png" 'png) ("image/jpeg" 'jpeg) (_ nil)))
+          (window (get-buffer-window (current-buffer))))
+      ;; An Emacs built without the image's library draws the pane's text
+      ;; only; the rows above say what the frame is.
+      (when (and type (image-type-available-p type))
+        (apply #'create-image data type t
+               (when (and window (display-images-p))
+                 (list :max-width (window-body-width window t)
+                       :max-height (window-body-height window t))))))))
+
+(defun codetracer--insert-image ()
+  "Insert the pane's image under its rows."
+  (when codetracer--image
+    (goto-char (point-max))
+    (insert "\n")
+    (insert-image codetracer--image "[frame]")))
 
 (defun codetracer--hotspot-at (pos)
   "The hotspot (OPERATION . ARGS) at POS, or nil."
@@ -1082,7 +1162,7 @@ Run this after changing `codetracer-pane-user-map' or
 
 (define-fringe-bitmap 'codetracer-breakpoint
   [#b00111100 #b01111110 #b11111111 #b11111111
-   #b11111111 #b11111111 #b01111110 #b00111100]
+              #b11111111 #b11111111 #b01111110 #b00111100]
   nil nil 'center)
 
 (defun codetracer--fringe-string (bitmap face)
@@ -1152,10 +1232,10 @@ window when it is not a side window, else any live window that is not."
       (with-current-buffer (window-buffer window)
         (let ((first (line-number-at-pos (window-start window)))
               (last (line-number-at-pos (or (window-end window t) (point-max)))))
-          (codetracer--request :source/viewport
-                               `(:session ,(codetracer-session-id session)
-                                 :file ,file :firstLine ,first
-                                 :lastLine ,(max first last))))))))
+          (codetracer--send :source/viewport
+                            `(:session ,(codetracer-session-id session)
+                                       :file ,file :firstLine ,first
+                                       :lastLine ,(max first last))))))))
 
 (defun codetracer--on-window-scroll (window _start)
   "When the user scrolls a source WINDOW, report its visible lines."
@@ -1220,6 +1300,112 @@ window when it is not a side window, else any live window that is not."
            (codetracer-session-decorations session))
   (clrhash (codetracer-session-decorations session)))
 
+;;;; Desktop
+
+;; Emacs's `desktop' keeps the user's arrangement across restarts: the
+;; frames, the tab-bar tabs and the windows, including windows the user
+;; added beside ours.  A pane buffer saves which recording, pane, mode and
+;; tab it belonged to; after `desktop-read', each recording is opened again,
+;; the restored buffers become its panes, and the windows `desktop' put back
+;; are kept.  The server's layout is used only where no window survived.
+
+(defvar codetracer--restored-panes nil
+  "Pane buffers `desktop' restored, waiting for their session.")
+
+(defun codetracer--desktop-buffer-misc (_dirname)
+  "Return this pane buffer's session, for `desktop' to save, as a plist."
+  (when-let ((session (codetracer--session codetracer--pane-session)))
+    (list :trace (codetracer-session-trace session)
+          :pane codetracer--pane
+          :mode (codetracer-session-mode session)
+          :tab (codetracer-session-tab session))))
+
+;;;###autoload
+(defun codetracer--desktop-restore-pane (_file-name buffer-name misc)
+  "Restore the pane buffer BUFFER-NAME from its `desktop' MISC data."
+  (when (plist-get misc :trace)
+    (with-current-buffer (get-buffer-create buffer-name)
+      (codetracer-pane-mode)
+      (setq codetracer--pane (plist-get misc :pane))
+      (setq-local codetracer--restored misc)
+      (setq-local desktop-save-buffer #'codetracer--desktop-buffer-misc)
+      (push (current-buffer) codetracer--restored-panes)
+      (current-buffer))))
+
+;;;###autoload
+(with-eval-after-load 'desktop
+  (add-to-list 'desktop-buffer-mode-handlers
+               '(codetracer-pane-mode . codetracer--desktop-restore-pane))
+  (add-hook 'desktop-after-read-hook #'codetracer--desktop-reconnect))
+
+(defun codetracer--desktop-reconnect ()
+  "Open the sessions the restored pane buffers belonged to, and adopt them."
+  (let ((buffers (cl-remove-if-not #'buffer-live-p (nreverse codetracer--restored-panes)))
+        (traces nil))
+    (setq codetracer--restored-panes nil)
+    (dolist (b buffers)
+      (let ((misc (buffer-local-value 'codetracer--restored b)))
+        (unless (assoc (plist-get misc :trace) traces)
+          (push (cons (plist-get misc :trace) misc) traces))))
+    (dolist (entry (nreverse traces))
+      (condition-case err
+          (codetracer--adopt-restored (car entry) (cdr entry)
+                                      (cl-remove-if-not
+                                       (lambda (b) (equal (plist-get (buffer-local-value
+                                                                      'codetracer--restored b)
+                                                                     :trace)
+                                                          (car entry)))
+                                       buffers))
+        (error (message "CodeTracer: could not reopen %s: %s"
+                        (car entry) (error-message-string err)))))))
+
+(defun codetracer--adopt-restored (trace misc buffers)
+  "Reopen TRACE as `desktop' saved it (MISC) and adopt its pane BUFFERS."
+  (unless (codetracer--live-p)
+    (codetracer--start-server))
+  (let* ((result (codetracer--request :session/open `(:trace ,trace)))
+         (id (plist-get result :session))
+         (session (codetracer--make-session
+                   :id id :trace trace
+                   :title (file-name-nondirectory (directory-file-name trace))
+                   :mode (plist-get result :mode)
+                   :layout (plist-get result :layout)
+                   :graphics (plist-get result :graphics)))
+         (old-tab (plist-get misc :tab)))
+    (puthash id session codetracer--sessions)
+    (when-let ((pos (gethash id codetracer--early-positions)))
+      (setf (codetracer-session-position session) pos)
+      (remhash id codetracer--early-positions))
+    (setq codetracer--active-session id)
+    ;; The restored tab becomes the session's; its name names the new id.
+    (let ((codetracer--realizing t))
+      (tab-bar-mode 1)
+      (if (and old-tab (tab-bar--tab-index-by-name old-tab))
+          (tab-bar-select-tab-by-name old-tab)
+        (tab-bar-new-tab))
+      (tab-bar-rename-tab (codetracer--tab-name session)))
+    (setf (codetracer-session-tab session) (codetracer--tab-name session))
+    (dolist (b buffers)
+      (with-current-buffer b
+        (setq codetracer--pane-session id
+              codetracer--pane-open nil
+              codetracer--pane-size nil
+              codetracer--restored nil)
+        (rename-buffer (format "*codetracer %s: %s*" id codetracer--pane) t))
+      (puthash (buffer-local-value 'codetracer--pane b) b (codetracer-session-panes session)))
+    ;; The mode the user left it in.
+    (unless (equal (plist-get misc :mode) (codetracer-session-mode session))
+      (codetracer--run "session.toggle-product-mode" :session id))
+    ;; The windows `desktop' restored are the user's arrangement.
+    (if (codetracer--session-windows session)
+        (progn
+          (setf (codetracer-session-realized session) (codetracer-session-layout session))
+          (codetracer--show-layout session))
+      (codetracer--realize session))
+    (when-let ((pos (codetracer-session-position session)))
+      (codetracer--show-position session pos))
+    session))
+
 ;;;; Hooks
 
 (defun codetracer--install-hooks ()
@@ -1272,6 +1458,27 @@ window when it is not a side window, else any live window that is not."
   "Switch the session between its debug and edit modes."
   (interactive)
   (codetracer--run "session.toggle-product-mode"))
+
+(defun codetracer-show-frames ()
+  "Show the frames a recording with graphics carries, in a pane of their own.
+The frame viewer draws the current frame as an image when this Emacs
+can display images, and as a line of text otherwise."
+  (interactive)
+  (let ((session (or (codetracer--current-tab-session)
+                     (user-error "This tab shows no CodeTracer session"))))
+    (unless (eq (plist-get (codetracer-session-graphics session) :available) t)
+      (user-error "This recording carries no graphics%s"
+                  (if-let ((why (plist-get (codetracer-session-graphics session) :error)))
+                      (concat ": " why) "")))
+    (let* ((buffer (codetracer--pane-buffer session "frameViewer"))
+           (codetracer--realizing t)
+           (window (display-buffer buffer '((display-buffer-in-side-window)
+                                            (side . bottom) (slot . 0)
+                                            (window-height . 0.4)
+                                            (dedicated . t)))))
+      (when window
+        (codetracer--sync-pane-size window 'open))
+      window)))
 
 (defun codetracer-dap-endpoint ()
   "The pane server's DAP endpoint, as (HOST . PORT), or nil.
