@@ -71,6 +71,21 @@
     (should (= (funcall at 6) 4)))
   (should (eq (codetracer--byte-offsets "plain") #'identity)))
 
+(ert-deftest codetracer-test-byte-column ()
+  "The cursor's column is reported in UTF-8 bytes, as the protocol counts."
+  :tags '(unit)
+  (with-temp-buffer
+    ;; A tab (one byte, eight display columns) and "▾" (three bytes, one
+    ;; display column) before "x".
+    (insert "\t▾x")
+    (goto-char (point-min))
+    (search-forward "x")
+    (backward-char)
+    (should (= (codetracer--byte-column) 5))
+    (should (/= (codetracer--byte-column) (1+ (current-column))))
+    (goto-char (line-beginning-position))
+    (should (= (codetracer--byte-column) 1))))
+
 (ert-deftest codetracer-test-style-faces ()
   :tags '(unit)
   (should (eq (codetracer--style-face "ct.value-modified") 'codetracer-value-modified))

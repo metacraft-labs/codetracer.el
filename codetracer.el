@@ -2338,13 +2338,23 @@ It lists the sources on this disk; `codetracer-sources' offers them all."
 (defvar codetracer--cursor-sent nil
   "The (FILE LINE COLUMN) last reported with `source/cursor'.")
 
+(defun codetracer--byte-column ()
+  "Point's column as the protocol counts it: 1-based, in bytes of UTF-8.
+The pane server's positions are byte offsets (`positionEncoding' utf-8,
+the LSP base protocol's), so a tab is one byte and a non-ASCII character
+its UTF-8 length; `current-column' counts display columns instead, and
+the two differ on any line with either."
+  (1+ (- (position-bytes (point))
+         (position-bytes (line-beginning-position)))))
+
 (defun codetracer--send-cursor (session file &optional force)
   "Report point, in FILE, as SESSION's cursor (`source/cursor').
-The line and the column are 1-based.  A cursor already reported is not
-sent again, unless FORCE: an operation about to act at the cursor sends
-it whatever was sent before, since another session's report may have
-come between."
-  (let ((at (list file (line-number-at-pos) (1+ (current-column)))))
+The line and the column are 1-based, the column in bytes
+\=(`codetracer--byte-column').  A cursor already reported is not sent
+again, unless FORCE: an operation about to act at the cursor sends it
+whatever was sent before, since another session's report may have come
+between."
+  (let ((at (list file (line-number-at-pos) (codetracer--byte-column))))
     (when (or force (not (equal at codetracer--cursor-sent)))
       (setq codetracer--cursor-sent at)
       (codetracer--notify :source/cursor
