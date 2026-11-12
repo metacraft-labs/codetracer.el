@@ -2034,5 +2034,70 @@ context menu offers the command."
            (ert-fail (format "the pane does not show %S; it shows:\n%s" directive
                              (with-current-buffer pane (buffer-string))))))))))
 
+;;;; A project folder in Edit mode, and its generated C (HSF-E11)
+
+(defconst codetracer-test--zebra-line 42
+  "The line of `codetracer-test--zebra-nim' whose C the test asks for.")
+
+(defun codetracer-test--zebra-nim ()
+  "A Nim file whose line 42 is far below the top of its C."
+  (concat (mapconcat (lambda (i) (format "proc filler%d(): int = %d\n" i i))
+                     (number-sequence 1 40) "")
+          "proc triple(n: int): int =\n"
+          "  let zebraCount = n * 3\n"
+          "  result = zebraCount + 1\n"
+          "\n"
+          "echo triple(14)\n"))
+
+(ert-deftest codetracer-test-native-project-generated-c-in-edit-mode ()
+  "A folder with no recording opens in Edit mode, and shows a line's C.
+`codetracer-open' sends the folder as a project (Editor-Hosted-Front-Ends
+E9); `codetracer-view-generated-c' there compiles the saved file with the
+real `nim' on PATH, and the pane shows the C of the line at point -- far
+below the file's top, so shown means scrolled to."
+  :tags '(native)
+  (unless (executable-find "nim")
+    (ert-fail "the edit-mode generated-C case needs `nim' on PATH"))
+  (let ((project (file-name-as-directory (make-temp-file "codetracer-el-e11" t))))
+    (with-temp-file (expand-file-name "tiny.nim" project)
+      (insert (codetracer-test--zebra-nim)))
+    (unwind-protect
+        (codetracer-test--with-server
+          (let ((session (codetracer-open project)))
+            (should (equal (codetracer-session-mode session) "edit"))
+            (should (cl-find-if (lambda (s) (and (eql (plist-get s :session)
+                                                      (codetracer-session-id session))
+                                                 (equal (plist-get s :project)
+                                                        (directory-file-name project))))
+                                (codetracer--request :session/list)))
+            (codetracer-test--settle)
+            (select-window (codetracer--source-window session))
+            (let ((buffer (find-file (expand-file-name "tiny.nim" project))))
+              (with-current-buffer buffer
+                (goto-char (point-min))
+                (forward-line (1- codetracer-test--zebra-line))
+                (forward-char 2)
+                (should (eq (plist-get (codetracer-view-generated-c) :ok) t))))
+            (codetracer-test--wait-for
+             (lambda () (codetracer-test--pane-window session "lowLevelCode"))
+             60 "the Low Level Code window the layout now places")
+            (let ((pane (gethash "lowLevelCode" (codetracer-session-panes session))))
+              (condition-case nil
+                  (codetracer-test--wait-for
+                   (lambda ()
+                     (with-current-buffer pane
+                       (save-excursion
+                         (goto-char (point-min))
+                         (search-forward "zebraCount" nil t))))
+                   120 "the compiled C of the line at point")
+                (ert-test-failed
+                 (ert-fail (format "the pane does not show the line's C; it shows:\n%s"
+                                   (with-current-buffer pane (buffer-string)))))))))
+      (dolist (b (buffer-list))
+        (when (and (buffer-file-name b) (string-prefix-p project (buffer-file-name b)))
+          (with-current-buffer b (set-buffer-modified-p nil))
+          (kill-buffer b)))
+      (delete-directory project t))))
+
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

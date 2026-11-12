@@ -43,6 +43,8 @@
 # Besides CODETRACER_TUI it needs:
 #   CODETRACER_TEST_NATIVE_NIM_TRACE  codetracer-example-recordings/nim/flow_test
 #   CODETRACER_CT_NATIVE_REPLAY_CMD   the native backend (`ct-native-replay`)
+# and, for its edit-mode case (a project folder, no recording, its Nim file
+# compiled to C now), `nim` on PATH.
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 

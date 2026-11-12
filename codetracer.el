@@ -544,15 +544,22 @@ be a local process's: the home directory is used then."
 
 ;;;###autoload
 (defun codetracer-open (trace)
-  "Open the CodeTracer recording TRACE in a session of its own.
-The first session starts the pane server, in this buffer's
-`default-directory': that directory is the project Edit mode works on."
-  (interactive (list (read-file-name "CodeTracer recording: " nil nil t)))
+  "Open the CodeTracer recording or project TRACE in a session of its own.
+A folder is sent as a project: the server opens the recording when the
+folder holds one, as `ct' does, and otherwise opens the folder in Edit
+mode, with no recording.  The first session starts the pane server, in
+this buffer's `default-directory': that directory is the project Edit
+mode works on for a recording."
+  (interactive (list (read-file-name "CodeTracer recording or project: " nil nil t)))
   (unless (codetracer--live-p)
     (codetracer--start-server))
-  (let* ((result (codetracer--request :session/open
-                                      `(:trace ,(expand-file-name trace))))
-         (session (codetracer--new-session (expand-file-name trace) result)))
+  (let* ((folder (directory-file-name (expand-file-name trace)))
+         (result (codetracer--request
+                  :session/open
+                  (if (file-directory-p folder)
+                      `(:project ,folder)
+                    `(:trace ,folder))))
+         (session (codetracer--new-session folder result)))
     (setq codetracer--active-session (codetracer-session-id session))
     (codetracer--fetch-sources session)
     (codetracer--watch-sources session)

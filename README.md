@@ -23,6 +23,7 @@ or named by `codetracer-server-program`.
 
     M-x codetracer-open RET /path/to/recording RET
 
+- A folder that holds no recording opens as a project, in Edit mode.
 - Each recording is a session in a `tab-bar` tab of its own;
   `codetracer-switch-session` and the tab bar switch between them.
 - The panes of the session's mode are placed in side windows through
