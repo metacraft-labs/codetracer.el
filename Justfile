@@ -37,6 +37,12 @@
 # codetracer-nim (CodeTracer's dev shell provides both):
 #   CODETRACER_NIMSUGGEST  its trace-enabled nimsuggest
 #   nim                    its compiler, on PATH
+#
+# `test-native` shows a Nim line's generated C and the stop's disassembly in
+# the Low Level Code pane, over CodeTracer's native Nim example recording.
+# Besides CODETRACER_TUI it needs:
+#   CODETRACER_TEST_NATIVE_NIM_TRACE  codetracer-example-recordings/nim/flow_test
+#   CODETRACER_CT_NATIVE_REPLAY_CMD   the native backend (`ct-native-replay`)
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -67,6 +73,10 @@ test-edit:
 # Nim compile-time tracing from the context menu (see above).
 test-nim:
     {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag nim)))'
+
+# A Nim line's generated C, from a native recording (see above).
+test-native:
+    {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag native)))'
 
 lint: lint-elisp lint-nix
 

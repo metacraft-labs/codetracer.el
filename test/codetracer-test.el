@@ -158,6 +158,29 @@
        (should (< (abs (- (nth 2 (nth 2 leaves)) (/ 29.0 58.0))) 1e-9)))
      (should (< (abs (- (nth 1 (nth 0 sides)) (/ 28.0 200.0))) 1e-9)))))
 
+(ert-deftest codetracer-test-sides-beside-the-editor ()
+  "A pane split off the editor, inside the editor's node, is a side too."
+  :tags '(unit)
+  (codetracer-test--with-panes
+   ;; row[fileTree 1, column[row[editor 3, state 1] 3, calltrace 1] 3]: the
+   ;; layout after `split(editor, state, row, after)' and one below.
+   (let ((sides (codetracer--sides
+                 '(:kind "row"
+                   :children [(:kind "pane" :pane "fileTree" :weight 1)
+                              (:kind "column" :weight 3
+                               :children [(:kind "row" :weight 3
+                                           :children [(:kind "pane" :pane "editor" :weight 3)
+                                                      (:kind "pane" :pane "state" :weight 1)])
+                                          (:kind "pane" :pane "calltrace" :weight 1)])]))))
+     (should (equal (mapcar #'car sides) '(left bottom right)))
+     (should (equal (mapcar (lambda (s) (mapcar #'car (nth 2 s))) sides)
+                    '(("fileTree") ("calltrace") ("state"))))
+     (should (equal (mapcar (lambda (s) (nth 3 s)) sides) '((0) (1 1) (1 0 1))))
+     ;; Sizes are fractions of the frame across the side.
+     (should (< (abs (- (nth 1 (nth 0 sides)) 0.25)) 1e-9))
+     (should (< (abs (- (nth 1 (nth 1 sides)) 0.25)) 1e-9))
+     (should (< (abs (- (nth 1 (nth 2 sides)) (* 0.75 0.25))) 1e-9)))))
+
 (ert-deftest codetracer-test-sides-without-editor ()
   :tags '(unit)
   (codetracer-test--with-panes
@@ -580,7 +603,8 @@ all of them."
 
 (defun codetracer-test--pane-window (session pane)
   "The window showing SESSION's PANE, or nil."
-  (get-buffer-window (gethash pane (codetracer-session-panes session))))
+  (when-let ((buffer (gethash pane (codetracer-session-panes session))))
+    (get-buffer-window buffer)))
 
 (defun codetracer-test--reset-windows ()
   "One tab, one ordinary window, whatever the last test left.
@@ -1953,6 +1977,62 @@ stays in Edit mode."
           (with-current-buffer b (set-buffer-modified-p nil))
           (kill-buffer b)))
       (delete-directory project t))))
+
+;;;; The generated C of a Nim line, over a native recording
+
+(ert-deftest codetracer-test-native-generated-c-of-a-nim-line ()
+  "The C a Nim line compiled to is shown in the Low Level Code pane.
+The recording is CodeTracer's native Nim example, which bundles its
+generated C; the layout has no Low Level Code pane, so the server places
+one beside the source and the package opens its window.  The Nim buffer's
+context menu offers the command."
+  :tags '(native)
+  (codetracer-test--env "CODETRACER_CT_NATIVE_REPLAY_CMD")
+  (codetracer-test--with-server
+    (let* ((native (codetracer-test--env "CODETRACER_TEST_NATIVE_NIM_TRACE"))
+           (session (codetracer-open native)))
+      (codetracer-test--wait-for
+       (lambda ()
+         (let ((file (plist-get (codetracer-session-position session) :file)))
+           (and (stringp file) (string-match-p "nim_flow_test\\.nim\\'" file))))
+       120 "the stop in nim_flow_test.nim")
+      (codetracer-test--settle)
+      (should-not (codetracer-test--pane-window session "lowLevelCode"))
+      (let ((window (codetracer--source-window session)))
+        (should (window-live-p window))
+        (select-window window)
+        (with-current-buffer (window-buffer window)
+          (should (codetracer--nim-buffer-p))
+          ;; Point on the stop's line, where the user asks about its C.
+          (goto-char (point-min))
+          (forward-line (1- (plist-get (codetracer-session-position session) :line)))
+          (let ((submenu (codetracer-test--menu-binding
+                          (context-menu-map
+                           (codetracer-test--right-click window (window-point window)))
+                          'codetracer)))
+            (should (keymapp submenu))
+            (should (codetracer-test--menu-binding submenu 'codetracer-view-generated-c))
+            (should (codetracer-test--menu-binding submenu 'codetracer-view-disassembly)))
+          (should (eq (plist-get (codetracer-view-generated-c) :ok) t))))
+      (codetracer-test--wait-for
+       (lambda () (codetracer-test--pane-window session "lowLevelCode"))
+       60 "the Low Level Code window the layout now places")
+      ;; The C of the stop's line is in view: the directive naming it, not
+      ;; the `#define's at the top of the file.
+      (let ((directive (format "#line %d " (plist-get (codetracer-session-position session)
+                                                      :line)))
+            (pane (gethash "lowLevelCode" (codetracer-session-panes session))))
+        (condition-case nil
+            (codetracer-test--wait-for
+             (lambda ()
+               (with-current-buffer pane
+                 (save-excursion
+                   (goto-char (point-min))
+                   (search-forward directive nil t))))
+             60 directive)
+          (ert-test-failed
+           (ert-fail (format "the pane does not show %S; it shows:\n%s" directive
+                             (with-current-buffer pane (buffer-string))))))))))
 
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

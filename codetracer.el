@@ -770,24 +770,50 @@ the pane's own, or its stack's."
   "Return LAYOUT's sides: a list of (SIDE SIZE-FRACTION PANE-LIST PATH).
 SIDE is a symbol `display-buffer-in-side-window' understands, SIZE the
 side's fraction of the frame across it, PANE-LIST its panes as
-`codetracer--visible-leaves' gives them, PATH the root child's path."
-  (let* ((kind (codetracer--node-kind layout))
-         (kids (codetracer--node-children layout))
+`codetracer--visible-leaves' gives them, PATH the path of the node the
+side shows.  The user's windows take the editor's place: each node beside
+the editor's path, at every depth of it, is a side (a pane split off the
+editor -- the Low Level Code pane an operation places, say -- is one), so
+one SIDE symbol may come more than once, the outer node first."
+  (if (not (member (codetracer--node-kind layout) '("row" "column")))
+      ;; A layout that is one pane or one stack: a side of its own.
+      (list (list 'right 0.5 (codetracer--visible-leaves layout nil 1.0) nil))
+    (codetracer--sides-around-editor layout nil 1.0 1.0)))
+
+(defun codetracer--sides-around-editor (node path width height)
+  "The sides of row or column NODE, at PATH, which spans WIDTH and HEIGHT.
+Those are fractions of the frame.  The child holding the editor is not a
+side; when it is itself a row or a column, the sides around the editor
+inside it follow."
+  (let* ((kind (codetracer--node-kind node))
+         (row (equal kind "row"))
+         (kids (codetracer--node-children node))
          (total (apply #'+ (mapcar #'codetracer--node-weight kids)))
          (editor (cl-position-if #'codetracer--holds-editor-p kids))
-         (i -1))
-    (if (not (member kind '("row" "column")))
-        ;; A layout that is one pane or one stack: a side of its own.
-        (list (list 'right 0.5 (codetracer--visible-leaves layout nil 1.0) nil))
-      (cl-loop for kid in kids
-               do (cl-incf i)
-               unless (eql i editor)
-               collect (list (if (equal kind "row")
-                                 (if (and editor (< i editor)) 'left 'right)
-                               (if (and editor (< i editor)) 'top 'bottom))
-                             (if (> total 0) (/ (codetracer--node-weight kid) total) 0.25)
-                             (codetracer--visible-leaves kid (list i) 1.0)
-                             (list i))))))
+         (i -1)
+         (sides
+          (cl-loop for kid in kids
+                   do (cl-incf i)
+                   unless (eql i editor)
+                   collect (let ((fraction (if (> total 0)
+                                               (/ (codetracer--node-weight kid) (float total))
+                                             0.25)))
+                             (list (if row
+                                       (if (and editor (< i editor)) 'left 'right)
+                                     (if (and editor (< i editor)) 'top 'bottom))
+                                   (* fraction (if row width height))
+                                   (codetracer--visible-leaves kid (append path (list i)) 1.0)
+                                   (append path (list i)))))))
+    (if-let* ((editor)
+              (inner (nth editor kids))
+              ((member (codetracer--node-kind inner) '("row" "column"))))
+        (let ((fraction (if (> total 0) (/ (codetracer--node-weight inner) (float total)) 1.0)))
+          (append sides
+                  (codetracer--sides-around-editor
+                   inner (append path (list editor))
+                   (if row (* width fraction) width)
+                   (if row height (* height fraction)))))
+      sides)))
 
 (defun codetracer--pane-buffer-name (id pane)
   "The name of the buffer showing session ID's PANE: ct://ID/PANE.
@@ -845,17 +871,20 @@ to the old name; when both names are taken, the old one goes."
   (setf (codetracer-session-realized session) (codetracer-session-layout session))
   (let ((codetracer--realizing t)
         (sides (codetracer--sides (codetracer-session-layout session)))
-        (shown nil))
+        (shown nil)
+        ;; Per SIDE symbol: the next slot, and the leaves shown there (a
+        ;; symbol may come more than once, `codetracer--sides').
+        (slots nil)
+        (along nil))
     ;; Our previous windows go; the user's source windows stay.
     (dolist (w (codetracer--pane-windows))
       (when (window-live-p w)
         (ignore-errors (delete-window w))))
     (dolist (side sides)
-      (pcase-let ((`(,where ,size ,leaves ,_path) side)
-                  (slot -1))
+      (pcase-let ((`(,where ,size ,leaves ,_path) side))
         (dolist (leaf leaves)
-          (cl-incf slot)
-          (let* ((pane (nth 0 leaf))
+          (let* ((slot (setf (alist-get where slots) (1+ (alist-get where slots -1))))
+                 (pane (nth 0 leaf))
                  (buffer (codetracer--leaf-buffer session pane))
                  (window (display-buffer
                           buffer
@@ -869,7 +898,9 @@ to the old name; when both names are taken, the old one goes."
             (when window
               (set-window-parameter window 'codetracer-side where)
               (push (cons window leaf) shown))))
-        (codetracer--apply-shares where leaves)))
+        (setf (alist-get where along) (append (alist-get where along) leaves))))
+    (dolist (entry along)
+      (codetracer--apply-shares (car entry) (cdr entry)))
     ;; Panes the server keeps open that this layout does not show.
     (maphash (lambda (_pane buffer)
                (when (and (buffer-live-p buffer) (not (get-buffer-window buffer)))
@@ -2548,6 +2579,11 @@ Emacs's own lock, backup and auto-save files are not the user's files."
     ("Evaluate with nim e" . codetracer-trace-eval))
   "The CodeTracer submenu of a Nim buffer's context menu: label, command.")
 
+(defconst codetracer--generated-code-items
+  '(("View generated C" . codetracer-view-generated-c)
+    ("View disassembly" . codetracer-view-disassembly))
+  "The generated-code entries of a Nim buffer's CodeTracer submenu.")
+
 (defun codetracer--nim-buffer-p (&optional buffer)
   "Non-nil when BUFFER (the current one when nil) is Nim source.
 That is a `.nim' or `.nims' file, or a buffer in `nim-mode' or a mode
@@ -2562,11 +2598,11 @@ derived from it (`nimscript-mode' among them)."
   (or (codetracer--current-tab-session)
       (and codetracer--active-session (codetracer--session codetracer--active-session))))
 
-(defun codetracer--trace-at-point (operation)
-  "Run the Nim trace OPERATION at point, in the selected window.
-Point is reported as the session's cursor first (`source/cursor').  A
-refusal -- no Nim tracer, nothing to trace at the cursor -- is shown in
-the echo area; the recording opens in a tab of its own when it is made."
+(defun codetracer--run-at-point (operation)
+  "Run OPERATION at point, in the selected window.
+Point is reported as the session's cursor first (`source/cursor'), since
+the server acts at the cursor it was last told of.  A refusal is shown in
+the echo area."
   (unless (codetracer--live-p)
     (user-error "CodeTracer is not running; start it with `codetracer-open'"))
   (let ((session (or (codetracer--nim-session)
@@ -2575,6 +2611,12 @@ the echo area; the recording opens in a tab of its own when it is made."
                   (user-error "This buffer shows no file"))))
     (codetracer--send-cursor session file t)
     (codetracer--run operation :session (codetracer-session-id session))))
+
+(defun codetracer--trace-at-point (operation)
+  "Run the Nim trace OPERATION at point, in the selected window.
+A refusal -- no Nim tracer, nothing to trace at the cursor -- is shown in
+the echo area; the recording opens in a tab of its own when it is made."
+  (codetracer--run-at-point operation))
 
 (defun codetracer-trace-macro-at-point ()
   "Trace the expansion of the Nim macro at point; its recording opens.
@@ -2600,6 +2642,22 @@ The trace reads the saved file."
   (interactive)
   (codetracer--trace-at-point "editor.trace-eval"))
 
+;; The C a Nim line compiled to, and the machine code: both are shown in the
+;; Low Level Code pane, which the server places beside the source when the
+;; layout has none (its `layout/changed' opens the pane's window).  The C is
+;; read from the recording, which bundles the generated C of a native Nim
+;; program; a line of another language is refused with the reason.
+
+(defun codetracer-view-generated-c ()
+  "Show the C the Nim line at point compiled to, in the Low Level Code pane."
+  (interactive)
+  (codetracer--run-at-point "view.generated-c-source"))
+
+(defun codetracer-view-disassembly ()
+  "Show the machine code of the stop in the Low Level Code pane."
+  (interactive)
+  (codetracer--run-at-point "view.disassembly"))
+
 (defun codetracer--at-click (click command)
   "A command running COMMAND with point where CLICK was."
   (lambda ()
@@ -2613,7 +2671,8 @@ The trace reads the saved file."
   "Add CodeTracer's Nim tracing to MENU, the context menu CLICK opened.
 In a Nim buffer while a CodeTracer session is open, a \"CodeTracer\"
 submenu traces the macro, the static block or the constant at the click,
-or evaluates the file with `nim e'; the click's position becomes point
+evaluates the file with `nim e', or shows the click's line's generated C
+or the stop's disassembly; the click's position becomes point
 before the item runs.  Anywhere else MENU is left as it is.  This is an
 entry of `context-menu-functions', added while the pane server runs."
   (let* ((window (posn-window (event-start click)))
@@ -2621,7 +2680,8 @@ entry of `context-menu-functions', added while the pane server runs."
     (when (and (codetracer--live-p) (codetracer--nim-session)
                (codetracer--nim-buffer-p buffer))
       (let ((submenu (make-sparse-keymap "CodeTracer")))
-        (dolist (item (reverse codetracer--nim-trace-items))
+        (dolist (item (reverse (append codetracer--nim-trace-items
+                                       codetracer--generated-code-items)))
           (define-key submenu (vector (cdr item))
                       `(menu-item ,(car item) ,(codetracer--at-click click (cdr item)))))
         (define-key-after menu [codetracer-separator] menu-bar-separator)

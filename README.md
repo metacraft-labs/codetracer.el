@@ -140,6 +140,14 @@ or named by `codetracer-server-program`.
   the environment the pane server starts in (`codetracer-server-environment`
   can set both) -- as CodeTracer's terminal does; without them the command
   says in the echo area what is missing.
+- While debugging a native Nim recording, `codetracer-view-generated-c`
+  shows the C the Nim line at point compiled to in the Low Level Code
+  pane, and `codetracer-view-disassembly` shows the stop's machine code
+  there. CodeTracer places the pane beside the source if the layout has
+  none. Both are also in the Nim buffer's CodeTracer submenu. The C comes
+  from the recording, which bundles a native Nim program's generated C
+  files and maps each run of C back to its Nim line by the compiler's
+  `#line` directives.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 
