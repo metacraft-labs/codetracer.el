@@ -42,10 +42,47 @@ or named by `codetracer-server-program`.
 - Every CodeTracer operation is a command: `codetracer-` and the
   operation's name, the dot replaced by a dash
   (`codetracer-debugger-step-over`); `codetracer-run-operation` picks one
-  by name. The usual ones have short names: `codetracer-step-over`,
-  `codetracer-step-into`, `codetracer-step-out`,
-  `codetracer-reverse-step-over`, `codetracer-continue`,
-  `codetracer-reverse-continue`.
+  by name. The debugger's are defined as soon as the package loads, so you
+  can bind them before a session is open, and have short names too:
+  `codetracer-step-over`, `codetracer-step-into`, `codetracer-step-out`,
+  their `codetracer-reverse-` counterparts, `codetracer-continue`,
+  `codetracer-reverse-continue`, `codetracer-run-to-entry`,
+  `codetracer-stop`, `codetracer-toggle-breakpoint` and
+  `codetracer-toggle-tracepoint`.
+- An operation the session cannot perform now (a disabled control, a test
+  that is no longer listed) is refused, and the reason is shown in the echo
+  area: `CodeTracer: tests.open-test: that test is no longer listed`.
+- The debugger controls (reverse and forward Next, Step in, Step out and
+  Continue, Run to entry, Stop) are drawn at the right of the tab bar while
+  a session's tab is current: click one to run it. A control that cannot
+  act now is dimmed and does nothing; hovering one shows its name and key.
+  CodeTracer adds its item to `tab-bar-format` only when the format is
+  Emacs's default, and gives the format back when the last session closes.
+  With a format of your own, add `codetracer-tab-bar-controls` to it
+  yourself, after `tab-bar-format-align-right`:
+
+  ```elisp
+  (setq tab-bar-format
+        '(tab-bar-format-tabs
+          tab-bar-separator
+          tab-bar-format-align-right
+          codetracer-tab-bar-controls))
+  ```
+
+  `codetracer-controls-glyphs` picks how a control is drawn (`unicode`,
+  the default; `nerd`, for a Nerd Font; or `text`), and
+  `codetracer-controls` set to nil draws none.
+
+- In the session's source buffer, while its tab is current, the debugger
+  keys of your CodeTracer keymap are bound -- stepping, continuing, the
+  breakpoint and tracepoint toggles -- but only their function-key chords
+  (`<f10>`, `S-<f11>`, `C-<f10>` ...), never a printable key or a `C-`
+  letter, which are Emacs's own. They are a buffer-local minor mode,
+  `codetracer-source-mode`, so `C-h k` and `C-h m` show them. A key you
+  bind yourself, globally or in the buffer's modes, wins; only Emacs's own
+  default function-key commands (F10's `menu-bar-open`, F11's
+  `toggle-frame-fullscreen` ...) give way. Set `codetracer-source-keys` to
+  nil to bind none.
 - The source window follows the debugger. The execution line is
   highlighted with an arrow in the fringe, breakpoints and tracepoints are
   fringe marks, and recorded values are shown at the ends of lines.
@@ -61,6 +98,17 @@ or named by `codetracer-server-program`.
 - Sessions survive a restart with `desktop-save-mode`: the recordings are
   opened again and their panes keep the windows you arranged, beside your
   own.
+- Edit mode works on a project: the directory the pane server started in,
+  which is the `default-directory` of the buffer you ran `codetracer-open`
+  from the first time (a remote one cannot be: the home directory is used
+  then). Its Files pane lists that project, and its Test Results, Build
+  Output and Problems panes run its tests and builds. To work on another
+  project, `codetracer-quit` and open from a buffer in it.
+- A recording CodeTracer makes for you -- a test recorded from the Test
+  Results pane, a Nim compile-time trace -- opens as a session of its own,
+  in a new tab, and the echo area says so. With the "current tab"
+  placement it takes the place of the session it was made from, whose tab
+  closes.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 
@@ -69,7 +117,9 @@ or named by `codetracer-server-program`.
 `nix develop` (or `direnv allow`) gives a shell with Emacs and the
 repository's hooks; then `just build`, `just test`, `just lint`.
 `just test-server` runs the scenarios against a real pane server and
-recording; the Justfile names the environment it needs.
+recording, and `just test-edit` records a test of a Noir crate from the
+Test Results pane with the real `ct` and `nargo`; the Justfile names the
+environment they need.
 
 Status: under development.
 

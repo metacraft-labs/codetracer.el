@@ -21,6 +21,13 @@
 #                                 tests/corpus_phase1/mpv
 # Without them it fails, by design: a suite that skipped would pass with no
 # server at all.
+#
+# `test-edit` records a test of a two-test Noir crate from the Test Results
+# pane and checks its recording opens in a tab of its own. Besides the
+# variables above (CODETRACER_TUI, CODETRACER_TEST_TRACE) it needs the real
+# recorder:
+#   CT_BIN                 the `ct` binary, when it is not on PATH
+#   nargo                  on PATH (the crate is a Noir one)
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -42,6 +49,11 @@ test-unit:
 # The package against a real pane server and recording (see above).
 test-server:
     {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag server)))'
+
+# Edit-mode services: a test recorded from Test Results opens as a session
+# of its own (see above).
+test-edit:
+    {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag edit)))'
 
 lint: lint-elisp lint-nix
 

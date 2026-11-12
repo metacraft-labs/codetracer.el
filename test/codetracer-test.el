@@ -213,11 +213,11 @@
   (let ((codetracer-media '("text" "image")))
     (should (equal (codetracer--media) '("text" "image")))))
 
-;; What the user is shown of an `operation/run' answer.  The function is
-;; called with answers in the protocol's shape; the server's own refusals
-;; (error answers) are exercised against the real server below.  `ok: false'
-;; is part of the result's contract but no operation of the server answers it
-;; today, so this is the only place that branch can be checked.
+;; What the user is shown of an `operation/run' answer, for answers in the
+;; protocol's shape, including the ones the real server does not give for any
+;; operation on the recordings the scenarios use (an empty refusal reason).
+;; Both kinds of refusal the server gives, an error answer and `ok: false'
+;; with its reason, are exercised against it below.
 (ert-deftest codetracer-test-operation-results-shown ()
   "A refusal or a detail in an `operation/run' answer is shown to the user."
   :tags '(unit)
@@ -290,6 +290,164 @@
     (codetracer-test--with-panes
      (should (equal (mapcar #'car (nth 2 (nth 1 (codetracer--sides layout))))
                     '("state" "calltrace" "terminalOutput"))))))
+
+(ert-deftest codetracer-test-source-bindings ()
+  "Only the debugger's function-key chords of the editor keymap are a source buffer's."
+  :tags '(unit)
+  (should (equal (codetracer--source-bindings
+                  [(:key "F10" :operation "debugger.step-over" :layer "base:global")
+                   (:key "n" :operation "debugger.step-over" :layer "base:global")
+                   (:key "Ctrl+A" :operation "select-all" :layer "base:editor")
+                   (:key "Shift+F11" :operation "debugger.reverse-step-into" :layer "base:global")
+                   (:key "Ctrl+F5" :operation "session.toggle-product-mode" :layer "base:global")
+                   (:key "F3" :operation "find.next" :layer "base:editor")
+                   (:key "F9" :operation "editor.toggle-breakpoint" :layer "base:editor")
+                   (:key "Ctrl+K Shift+F10" :operation "context-menu.open" :layer "base:global")
+                   (:key "Alt+Shift+F10" :operation "debugger.reverse-step-over-statement")
+                   (:key "F10" :operation "debugger.continue" :layer "user")
+                   (:key "F12" :operation "debugger.step-out" :shadowedBy "editor")
+                   (:key "Ctrl+Enter" :operation "editor.toggle-tracepoint")])
+                 '(("<f10>" . "debugger.step-over")
+                   ("S-<f11>" . "debugger.reverse-step-into")
+                   ("<f9>" . "editor.toggle-breakpoint")
+                   ("M-S-<f10>" . "debugger.reverse-step-over-statement")))))
+
+(ert-deftest codetracer-test-source-keys-give-way-to-the-users ()
+  "A source buffer's debugger key gives way to any binding but Emacs's default."
+  :tags '(unit)
+  (let ((codetracer--source-key-buffers nil)
+        (session (codetracer--make-session
+                  :id 9 :source-bindings '(("<f10>" . "debugger.step-over")
+                                           ("<f5>" . "debugger.continue"))))
+        (old (keymap-lookup global-map "<f5>")))
+    (with-temp-buffer
+      (unwind-protect
+          (progn
+            (codetracer--bind-source-keys session (current-buffer))
+            (should codetracer-source-mode)
+            ;; F10 is Emacs's `menu-bar-open' by default: the debugger's here.
+            (should (eq (key-binding (kbd "<f10>")) 'codetracer-debugger-step-over))
+            (should (eq (key-binding (kbd "<f5>")) 'codetracer-debugger-continue))
+            ;; The user's own F5 wins, from the moment it is bound.
+            (keymap-global-set "<f5>" #'ignore)
+            (should (eq (key-binding (kbd "<f5>")) #'ignore))
+            (should (eq (key-binding (kbd "<f10>")) 'codetracer-debugger-step-over))
+            ;; And so does the major mode's.
+            (use-local-map (let ((m (make-sparse-keymap))) (keymap-set m "<f10>" #'undo) m))
+            (should (eq (key-binding (kbd "<f10>")) #'undo))
+            (codetracer--unbind-source-keys (current-buffer))
+            (should-not codetracer-source-mode)
+            (should-not (assq 'codetracer-source-mode minor-mode-overriding-map-alist))
+            (should-not codetracer--source-key-buffers))
+        (keymap-global-set "<f5>" old)))))
+
+(defconst codetracer-test--buttons
+  [(:id "next" :label "Next" :tooltip "Next (F10)" :operation "debugger.step-over"
+        :enabled t :glyphs (:nerd "N" :unicode "↷" :text "Next"))
+   (:id "reverse-next" :label "Reverse next" :tooltip "Reverse next (Shift+F10)"
+        :operation "debugger.reverse-step-over" :enabled :json-false
+        :glyphs (:nerd "R" :unicode "↶" :text ""))]
+  "Two `controls/state' buttons, one enabled, in the server's shape.")
+
+(ert-deftest codetracer-test-controls-items ()
+  "The current tab's controls are tab-bar items; a disabled one is dimmed and inert."
+  :tags '(unit)
+  (let* ((codetracer--sessions (make-hash-table))
+         (codetracer--tab-bar-format-taken nil)
+         (tab-bar-format (eval (car (get 'tab-bar-format 'standard-value)) t))
+         (session (codetracer--make-session
+                   :id 3 :tab (alist-get 'name (tab-bar--current-tab)))))
+    (puthash 3 session codetracer--sessions)
+    (codetracer--on-controls-state `(:session 3 :buttons ,codetracer-test--buttons))
+    (let ((items (codetracer-tab-bar-controls)))
+      (should (= (length items) 2))
+      (pcase-let ((`(,key menu-item ,caption ,binding :help ,help) (nth 0 items)))
+        (should (eq key 'codetracer-control-next))
+        (should (equal (substring-no-properties caption) " ↷ "))
+        (should (eq (get-text-property 1 'face caption) 'codetracer-control))
+        (should (commandp binding))
+        (should (equal help "Next (F10)")))
+      (pcase-let ((`(,_ menu-item ,caption ,binding . ,_) (nth 1 items)))
+        (should (eq (get-text-property 1 'face caption) 'codetracer-control-disabled))
+        (should (eq binding #'ignore))))
+    ;; The glyph set is the user's choice; an empty glyph is the label.
+    (let ((codetracer-controls-glyphs 'text))
+      (should (equal (mapcar (lambda (i) (substring-no-properties (nth 2 i)))
+                             (codetracer-tab-bar-controls))
+                     '(" Next " " Reverse next "))))
+    ;; Outside a session's tab, nothing.
+    (setf (codetracer-session-tab session) "not this tab")
+    (should-not (codetracer-tab-bar-controls))))
+
+(ert-deftest codetracer-test-tab-bar-format-taken-and-given-back ()
+  "The default `tab-bar-format' gets the controls while sessions are open; a
+format of the user's own is left alone."
+  :tags '(unit)
+  (let* ((default (eval (car (get 'tab-bar-format 'standard-value)) t))
+         (codetracer--sessions (make-hash-table))
+         (codetracer--tab-bar-format-taken nil)
+         (codetracer--tab-bar-format-offered t)
+         (codetracer-controls 'tab-bar)
+         (tab-bar-format (copy-sequence default)))
+    (puthash 1 (codetracer--make-session :id 1) codetracer--sessions)
+    (codetracer--sync-controls)
+    (should (equal tab-bar-format (append default '(tab-bar-format-align-right
+                                                    codetracer-tab-bar-controls))))
+    ;; Once only.
+    (codetracer--sync-controls)
+    (should (= (cl-count 'codetracer-tab-bar-controls tab-bar-format) 1))
+    (clrhash codetracer--sessions)
+    (codetracer--sync-controls)
+    (should (equal tab-bar-format default))
+    ;; The user's own format.
+    (let ((mine '(tab-bar-format-tabs tab-bar-format-global)))
+      (setq tab-bar-format mine)
+      (puthash 1 (codetracer--make-session :id 1) codetracer--sessions)
+      (codetracer--sync-controls)
+      (should (eq tab-bar-format mine))
+      (clrhash codetracer--sessions)
+      (codetracer--sync-controls)
+      (should (eq tab-bar-format mine)))
+    ;; Turned off: nothing is taken.
+    (let ((codetracer-controls nil))
+      (setq tab-bar-format (copy-sequence default))
+      (puthash 1 (codetracer--make-session :id 1) codetracer--sessions)
+      (codetracer--sync-controls)
+      (should (equal tab-bar-format default)))))
+
+;; With Emacs 30's jsonrpc the notifications that follow `session/open' are
+;; dispatched after its answer (measured: none of a session's arrive before it
+;; is registered), but a jsonrpc that dispatches from the process filter runs
+;; them while `codetracer-open' still waits.  The buffer is exercised here.
+(ert-deftest codetracer-test-early-notifications-applied ()
+  "Controls and keymaps that arrive before their session is registered are kept."
+  :tags '(unit)
+  (let ((codetracer--sessions (make-hash-table))
+        (codetracer--early-notifications (make-hash-table))
+        (codetracer--early-positions (make-hash-table))
+        (codetracer--tab-bar-format-taken nil)
+        (codetracer--source-key-buffers nil)
+        (codetracer-controls nil))
+    (codetracer--dispatch nil 'controls/state `(:session 4 :buttons ,codetracer-test--buttons))
+    (codetracer--dispatch nil 'pane/keymap
+                          '(:session 4 :pane "editor"
+                                     :bindings [(:key "F10" :operation "debugger.step-over")]))
+    (should (= (length (gethash 4 codetracer--early-notifications)) 2))
+    (let ((session (codetracer--new-session "/rec/calc" '(:session 4 :mode "debug"))))
+      (should (equal (codetracer-session-title session) "calc"))
+      (should (= (length (codetracer-session-controls session)) 2))
+      (should (equal (codetracer-session-source-bindings session)
+                     '(("<f10>" . "debugger.step-over"))))
+      (should-not (gethash 4 codetracer--early-notifications)))))
+
+(ert-deftest codetracer-test-server-directory ()
+  "The pane server starts in the current buffer's directory, the Edit-mode project."
+  :tags '(unit)
+  (let ((default-directory temporary-file-directory))
+    (should (equal (codetracer--server-directory)
+                   (expand-file-name temporary-file-directory))))
+  (let ((default-directory "/ssh:example.invalid:/srv/"))
+    (should (equal (codetracer--server-directory) (expand-file-name "~/")))))
 
 ;;;; Scenario tests against a real pane server
 
@@ -1002,6 +1160,271 @@ sooner than the server repaints."
      (should (cl-find-if (lambda (m) (string-match-p
                                       "\\`CodeTracer: frame-viewer.next-frame: .*graphics" m))
                          shown)))))
+
+(ert-deftest codetracer-test-ok-false-refusal-is-shown ()
+  "An operation the session cannot perform answers `ok: false' with its reason,
+and the user is shown it, from a pane's hotspot as from a command."
+  :tags '(server)
+  (codetracer-test--with-server
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (shown nil)
+          (record (lambda (format &rest args)
+                    (when format (push (apply #'format-message format args) shown)))))
+     (advice-add 'message :before record)
+     (unwind-protect
+         ;; What a click on a Test Results row's ⏵ sends, for a test that is
+         ;; not listed.
+         (let ((result (codetracer--run "tests.open-test" :pane "testResults"
+                                        :args '(:path "no-such-test")
+                                        :session (codetracer-session-id session))))
+           (should (eq (plist-get result :ok) :json-false))
+           (should (stringp (plist-get result :detail)))
+           (should-not (string-empty-p (plist-get result :detail))))
+       (advice-remove 'message record))
+     (should (cl-find-if (lambda (m) (string-match-p
+                                      "\\`CodeTracer: tests.open-test: .*no longer listed" m))
+                         shown)))))
+
+;;;; Debugger controls and source keys
+
+(defun codetracer-test--tick (session)
+  "SESSION's position's tick."
+  (plist-get (codetracer-session-position session) :tick))
+
+(defun codetracer-test--wait-tick-change (session tick what)
+  "Wait for SESSION's tick to differ from TICK, failing with WHAT."
+  (codetracer-test--wait-for (lambda () (not (eql (codetracer-test--tick session) tick)))
+                             30 what))
+
+(defun codetracer-test--tab-bar-item (key)
+  "The tab bar's item KEY as Emacs builds the tab bar: (KEY menu-item CAPTION ...)."
+  (cl-find key (cdr (tab-bar-make-keymap-1)) :key #'car-safe))
+
+(ert-deftest codetracer-test-controls-strip-in-the-tab-bar ()
+  "The debugger controls are drawn at the right of the tab bar; a click steps;
+after Stop every control is disabled and a click sends nothing; the
+tab bar's format is given back when the last session closes."
+  :tags '(server)
+  (let ((default (eval (car (get 'tab-bar-format 'standard-value)) t)))
+    (codetracer-test--with-server
+     (let ((tab-bar-format (copy-sequence default))
+           (codetracer-controls 'tab-bar)
+           (codetracer-controls-glyphs 'unicode))
+       (let* ((session (codetracer-open trace))
+              (_ (codetracer-test--settle))
+              (buttons (codetracer-session-controls session)))
+         (should (= (length buttons) 10))
+         (should (cl-find "next" buttons :key (lambda (b) (plist-get b :id)) :test #'equal))
+         ;; The format is the default one with the controls at its right.
+         (should (equal (last tab-bar-format 2)
+                        '(tab-bar-format-align-right codetracer-tab-bar-controls)))
+         ;; Built into the tab bar: the Next glyph, a button running Next.
+         (let ((next (codetracer-test--tab-bar-item 'codetracer-control-next)))
+           (should next)
+           (should (string-match-p "↷" (nth 2 next)))
+           (should (codetracer-test--tab-bar-item 'align-right))
+           (let ((tick (codetracer-test--tick session)))
+             ;; What `tab-bar-mouse-down-1' does with a click on the item.
+             (call-interactively (nth 3 next))
+             (codetracer-test--wait-tick-change session tick "the click's step")))
+         ;; Stop: every control is disabled, and a click does nothing.
+         (codetracer-stop)
+         (codetracer-test--settle)
+         (should (= (length (codetracer-session-controls session)) 10))
+         (should-not (cl-find-if #'codetracer--control-enabled-p
+                                 (codetracer-session-controls session)))
+         (let ((next (codetracer-test--tab-bar-item 'codetracer-control-next))
+               (tick (codetracer-test--tick session)))
+           (should (eq (nth 3 next) #'ignore))
+           (should (eq (get-text-property 1 'face (nth 2 next)) 'codetracer-control-disabled))
+           (codetracer-test--recording-sends
+             (call-interactively (nth 3 next))
+             (codetracer-test--settle)
+             (should-not (assoc "operation/run" codetracer-test--sent)))
+           (should (eql (codetracer-test--tick session) tick)))
+         ;; The last session closes: the format is the user's again.
+         (codetracer-close-session (codetracer-session-id session))
+         (should (equal tab-bar-format default))
+         (should-not (memq 'codetracer-tab-bar-controls tab-bar-format)))))))
+
+(ert-deftest codetracer-test-source-keys-step-and-yield ()
+  "The debugger's function keys work in the source buffer, the user's own
+binding of one of them wins, and leaving the session's tab takes them away."
+  :tags '(server)
+  (codetracer-test--with-server
+   (let* ((session (codetracer-open trace))
+          (_ (codetracer-test--settle))
+          (window (codetracer--source-window session))
+          (buffer (window-buffer window))
+          (bindings (codetracer-session-source-bindings session))
+          (step (car (rassoc "debugger.step-over" bindings)))
+          (other (car (cl-find-if (lambda (b) (not (equal (cdr b) "debugger.step-over")))
+                                  bindings))))
+     (should bindings)
+     ;; Only function-key chords, only the debugger's operations.
+     (pcase-dolist (`(,key . ,op) bindings)
+       (should (string-match-p "\\`\\(?:[ACHMSs]-\\)*<f[0-9]+>\\'" key))
+       (should (or (string-prefix-p "debugger." op) (string-prefix-p "editor.toggle-" op))))
+     (should step)
+     (should other)
+     (should (buffer-file-name buffer))
+     (with-current-buffer buffer
+       (should codetracer-source-mode)
+       (should (eq (key-binding (kbd step)) 'codetracer-debugger-step-over)))
+     ;; Pressing it steps.
+     (let ((tick (codetracer-test--tick session)))
+       (with-selected-window window
+         (execute-kbd-macro (kbd step)))
+       (codetracer-test--wait-tick-change session tick (format "%s's step" step)))
+     ;; The user's global binding of another of the keys wins.
+     (let* ((old (keymap-lookup global-map other))
+            (hit nil)
+            (mine (lambda () (interactive) (setq hit t))))
+       (unwind-protect
+           (progn
+             (keymap-global-set other mine)
+             (with-current-buffer buffer
+               (should codetracer-source-mode)
+               (should (eq (key-binding (kbd other)) mine)))
+             (with-selected-window window
+               (execute-kbd-macro (kbd other)))
+             (should hit))
+         (keymap-global-set other old)))
+     ;; Another tab: the source buffer has no CodeTracer keys there.
+     (tab-bar-new-tab)
+     (with-current-buffer buffer
+       (should-not codetracer-source-mode)
+       (should-not (eq (key-binding (kbd step)) 'codetracer-debugger-step-over)))
+     ;; Back in the session's tab, they are back.
+     (tab-bar-close-tab)
+     (codetracer-switch-session (codetracer-session-id session))
+     (with-current-buffer buffer
+       (should codetracer-source-mode))
+     ;; Turned off, none are bound.
+     (let ((codetracer-source-keys nil))
+       (codetracer--sync-source-keys)
+       (with-current-buffer buffer
+         (should-not codetracer-source-mode))))))
+
+;;;; Edit mode (tag `edit')
+
+;; A test recorded from CodeTracer's Test Results pane opens its recording as
+;; a session of its own, in a tab of its own (`session/opened').  Nothing is
+;; mocked: the project is the two-test Noir crate CodeTracer's own Test
+;; Results suites run (`plat53_noir_project.nim' in CodeTracer, byte for
+;; byte), written to a temporary directory the pane server is started in --
+;; its Edit-mode project is the directory it starts in.  Recording the test
+;; runs the real `ct record-test', which needs `ct' (CT_BIN, or on PATH) and
+;; `nargo' on PATH, besides what every scenario needs.  `just test-edit'
+;; runs it.
+
+(defconst codetracer-test--nargo-toml
+  "[package]\nname = \"plat53_suite\"\ntype = \"bin\"\nauthors = [\"\"]\n\n[dependencies]\n"
+  "The crate's Nargo.toml.")
+
+(defconst codetracer-test--main-nr
+  "fn main(x: Field, y: pub Field) {
+    assert(x != y);
+}
+
+#[test]
+fn test_passes() {
+    main(1, 2);
+}
+
+#[test]
+fn test_fails() {
+    main(1, 1);
+}
+"
+  "The crate's src/main.nr: one test that passes, one that fails.")
+
+(defun codetracer-test--write-crate ()
+  "Write the two-test Noir crate to a new temporary directory; return it."
+  (let ((dir (file-name-as-directory (make-temp-file "codetracer-el-crate" t))))
+    (make-directory (expand-file-name "src" dir))
+    (with-temp-file (expand-file-name "Nargo.toml" dir) (insert codetracer-test--nargo-toml))
+    (with-temp-file (expand-file-name "src/main.nr" dir) (insert codetracer-test--main-nr))
+    dir))
+
+(defun codetracer-test--show-stacked-pane (session pane)
+  "Show SESSION's PANE in the window of the stack it is one of; return the window."
+  (cl-loop for window in (codetracer--pane-windows)
+           for path = (append (window-parameter window 'codetracer-stack) nil)
+           for stack = (and path (codetracer--node-at (codetracer-session-layout session) path))
+           for index = (and stack (cl-position pane (codetracer--node-children stack)
+                                               :key #'codetracer--node-pane :test #'equal))
+           when index
+           do (codetracer--stack-select session window index)
+           and return window))
+
+(defun codetracer-test--row-hotspot (buffer needle operation)
+  "The hotspot (OPERATION . ARGS) on the row of BUFFER that contains NEEDLE, or nil."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (cl-loop while (search-forward needle nil t)
+               thereis (let ((end (line-end-position)))
+                         (cl-loop for pos from (line-beginning-position) below end
+                                  for spot = (codetracer--hotspot-at pos)
+                                  when (equal (car spot) operation) return spot))))))
+
+(ert-deftest codetracer-test-recorded-test-opens-a-session-tab ()
+  "A test recorded from Test Results opens its recording in a tab of its own."
+  :tags '(edit)
+  (let ((ct (or (getenv "CT_BIN") (executable-find "ct"))))
+    (unless (and ct (file-executable-p ct))
+      (ert-fail "ct is not found (CT_BIN or PATH): the edit-mode suite records with it"))
+    (unless (executable-find "nargo")
+      (ert-fail "nargo is not on PATH: the edit-mode suite's crate is a Noir one")))
+  (let* ((crate (codetracer-test--write-crate))
+         (certificates (make-temp-file "codetracer-el-certificates" t))
+         (process-environment (cons (concat "TEST_CERTIFICATES_DIR=" certificates)
+                                    process-environment)))
+    (unwind-protect
+        (codetracer-test--with-server
+          (let* ((session (let ((default-directory crate)) (codetracer-open trace)))
+                 (_ (codetracer-test--settle))
+                 (window (codetracer-test--show-stacked-pane session "testResults"))
+                 (buffer (gethash "testResults" (codetracer-session-panes session)))
+                 (spot nil))
+            (should window)
+            (should (eq (window-buffer window) buffer))
+            ;; Batch Emacs's frame is 80 columns: the pane is widened, as a
+            ;; user would drag it, so the rows have room for the tests' names.
+            (window-resize window (window-max-delta window t) t)
+            (codetracer--on-window-size-change (selected-frame))
+            ;; The server lists the crate's tests; the failing one's ⏵ records it.
+            (codetracer-test--wait-for
+             (lambda () (setq spot (codetracer-test--row-hotspot buffer "test_fails"
+                                                                 "tests.open-test")))
+             60 "the failing test's row in Test Results")
+            (let ((tabs (length (tab-bar-tabs))))
+              ;; What a click on the ⏵ runs (`codetracer-activate-hotspot').
+              (with-current-buffer buffer
+                (codetracer--run (car spot) :args (cdr spot) :pane codetracer--pane
+                                 :session codetracer--pane-session))
+              (let ((opened nil))
+                (codetracer-test--wait-for
+                 (lambda ()
+                   (setq opened (cl-loop for s being the hash-values of codetracer--sessions
+                                         unless (eq s session) return s)))
+                 240 "the recorded test's session")
+                (should (= (length (tab-bar-tabs)) (1+ tabs)))
+                (should (eq (codetracer--current-tab-session) opened))
+                (should-not (equal (codetracer-session-tab opened) (codetracer-session-tab session)))
+                (should (file-directory-p (codetracer-session-trace opened)))
+                (should (codetracer--session (codetracer-session-id session)))
+                (codetracer-test--wait-for (lambda () (codetracer-session-position opened))
+                                           60 "the recording's position")
+                ;; Its panes are shown, and its source followed.
+                (should (cl-find-if (lambda (w) (eql (buffer-local-value 'codetracer--pane-session
+                                                                         (window-buffer w))
+                                                     (codetracer-session-id opened)))
+                                    (codetracer--pane-windows)))))))
+      (delete-directory crate t)
+      (delete-directory certificates t))))
 
 (defun codetracer-test--png-size (data)
   "The (WIDTH . HEIGHT) a PNG's header in DATA declares."

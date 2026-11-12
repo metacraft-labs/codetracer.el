@@ -51,6 +51,15 @@
 ;; bound.  Every CodeTracer operation is also an `M-x' command named
 ;; `codetracer-' followed by the operation's name, with the dot replaced by
 ;; a dash (`codetracer-debugger-step-over').
+;;
+;; While a session's tab is current, the debugger controls are drawn at the
+;; right of the tab bar (`codetracer-tab-bar-controls'), and the debugger's
+;; function keys of your CodeTracer keymap are bound in the session's source
+;; buffer (`codetracer-source-mode'), your own bindings first.  A recording
+;; CodeTracer makes itself, such as a test recorded from the Test Results
+;; pane, opens in a tab of its own.  Edit mode works on the directory the
+;; pane server was started in: the `default-directory' of the buffer the
+;; first session was opened from.
 
 ;;; Code:
 
@@ -109,6 +118,37 @@ Nil means all it can draw: text, and images when `display-images-p'."
   (or codetracer-media
       (if (display-images-p) '("text" "image") '("text"))))
 
+(defcustom codetracer-controls 'tab-bar
+  "Where the debugger controls are drawn while a session's tab is current.
+With `tab-bar', they are drawn at the right of the tab bar: while a
+session is open, `codetracer-tab-bar-controls' is added to
+`tab-bar-format' after `tab-bar-format-align-right', and the format is
+given back when the last session closes.  That is done only when
+`tab-bar-format' is Emacs's default; a format of your own is left
+alone, and you add `codetracer-tab-bar-controls' to it where you want
+the controls.  With nil, the controls are not drawn."
+  :type '(choice (const :tag "At the right of the tab bar" tab-bar)
+                 (const :tag "Nowhere" nil)))
+
+(defcustom codetracer-controls-glyphs 'unicode
+  "How a debugger control is drawn.
+As its `unicode' symbol, its `nerd' Font icon (Codicons), or its
+`text' label."
+  :type '(choice (const :tag "Unicode symbols" unicode)
+                 (const :tag "Nerd Font icons" nerd)
+                 (const :tag "Text labels" text)))
+
+(defcustom codetracer-source-keys t
+  "Non-nil binds CodeTracer's debugger keys in the session's source buffer.
+They are the function-key bindings (F10, S-<f11>, C-<f10> ...) of the
+debugger operations in your CodeTracer keymap, bound while the
+session's tab is current, by `codetracer-source-mode'.  A key bound
+anywhere else in that buffer -- your global map, the major mode's map,
+another minor mode -- is left to that binding; only Emacs's own
+default function-key commands (F10's `menu-bar-open', F11's
+`toggle-frame-fullscreen', ...) give way."
+  :type 'boolean)
+
 ;;;; Faces
 
 (defface codetracer-chrome '((t :inherit default))
@@ -161,6 +201,10 @@ Nil means all it can draw: text, and images when `display-images-p'."
   "The name of a stacked pane its window does not show, in the window's tabs.")
 (defface codetracer-stack-tab-active '((t :inherit (highlight bold)))
   "The name of the stacked pane its window shows, in the window's tabs.")
+(defface codetracer-control '((t :inherit tab-bar))
+  "A debugger control in the tab bar.")
+(defface codetracer-control-disabled '((t :inherit (shadow tab-bar)))
+  "A debugger control that cannot act now, in the tab bar.")
 
 (defcustom codetracer-style-faces
   '(("chrome-text" . codetracer-chrome)
@@ -242,7 +286,11 @@ else unstyled."
   ;; The stacked panes the user picked from a window's tabs, as
   ;; (MODE . STACK-PATH) -> child index: the server's layouts do not carry
   ;; them, so they are applied to each layout it sends.
-  (stack-choices (make-hash-table :test #'equal)))
+  (stack-choices (make-hash-table :test #'equal))
+  ;; The debugger controls (`controls/state' buttons, as plists) and the
+  ;; source buffer's keys, (EMACS-KEY . OPERATION) from the `editor' pane's
+  ;; keymap.
+  controls source-bindings)
 
 (defvar codetracer--connection nil
   "The `jsonrpc-process-connection' to the pane server, or nil.")
@@ -263,6 +311,11 @@ else unstyled."
   "Positions that arrived before their session was registered, by id.
 `session/open' is answered first and followed by the session's position,
 which the process filter can dispatch before `codetracer-open' resumes.")
+
+(defvar codetracer--early-notifications (make-hash-table)
+  "Notifications for a session not registered yet, by id, newest first.
+Like its position, a session's keymaps and controls follow the answer to
+`session/open'; they are dispatched once the session is registered.")
 
 (defvar codetracer--window-change-timer nil
   "The pending timer that reports window changes, or nil.")
@@ -348,9 +401,21 @@ that waited there could run while another waits, out of order."
   "Send the notification METHOD with PARAMS to the pane server."
   (jsonrpc-notify (codetracer--connection) method (or params '())))
 
+(defun codetracer--server-directory ()
+  "The directory to start the pane server in: the current `default-directory'.
+The server's Edit mode works on the project it starts in, as `ct
+replay' works on the shell's, so this is the directory of the buffer
+the first session is opened from.  A remote or missing directory cannot
+be a local process's: the home directory is used then."
+  (let ((dir default-directory))
+    (if (and (stringp dir) (not (file-remote-p dir)) (file-directory-p dir))
+        (expand-file-name dir)
+      (expand-file-name "~/"))))
+
 (defun codetracer--start-server ()
-  "Start the pane server and initialize it."
-  (let* ((process-environment (append codetracer-server-environment
+  "Start the pane server, in `codetracer--server-directory', and initialize it."
+  (let* ((default-directory (codetracer--server-directory))
+         (process-environment (append codetracer-server-environment
                                       process-environment))
          (stderr (get-buffer-create " *codetracer stderr*"))
          (proc (make-process
@@ -397,18 +462,27 @@ that waited there could run while another waits, out of order."
         codetracer--server-info nil
         codetracer--active-session nil)
   (clrhash codetracer--sessions)
+  (clrhash codetracer--early-notifications)
+  (codetracer--sync-source-keys)
+  (codetracer--sync-controls)
   (codetracer--remove-hooks))
 
 (defun codetracer--dispatch (_conn method params)
   "Handle the server's notification METHOD with PARAMS."
-  (pcase method
-    ('pane/content (codetracer--on-pane-content params))
-    ('pane/keymap (codetracer--on-pane-keymap params))
-    ('layout/changed (codetracer--on-layout-changed params))
-    ('session/position (codetracer--on-position params))
-    ('source/decorations (codetracer--on-decorations params))
-    ('source/show (codetracer--on-source-show params))
-    (_ nil)))
+  (if (and (memq method '(pane/keymap controls/state))
+           (not (codetracer--session (plist-get params :session))))
+      (push (cons method params)
+            (gethash (plist-get params :session) codetracer--early-notifications))
+    (pcase method
+      ('pane/content (codetracer--on-pane-content params))
+      ('pane/keymap (codetracer--on-pane-keymap params))
+      ('layout/changed (codetracer--on-layout-changed params))
+      ('session/position (codetracer--on-position params))
+      ('source/decorations (codetracer--on-decorations params))
+      ('source/show (codetracer--on-source-show params))
+      ('session/opened (codetracer--on-session-opened params))
+      ('controls/state (codetracer--on-controls-state params))
+      (_ nil))))
 
 ;;;; Sessions and tabs
 
@@ -441,25 +515,16 @@ that waited there could run while another waits, out of order."
 
 ;;;###autoload
 (defun codetracer-open (trace)
-  "Open the CodeTracer recording TRACE in a session of its own."
+  "Open the CodeTracer recording TRACE in a session of its own.
+The first session starts the pane server, in this buffer's
+`default-directory': that directory is the project Edit mode works on."
   (interactive (list (read-file-name "CodeTracer recording: " nil nil t)))
   (unless (codetracer--live-p)
     (codetracer--start-server))
   (let* ((result (codetracer--request :session/open
                                       `(:trace ,(expand-file-name trace))))
-         (id (plist-get result :session))
-         (session (codetracer--make-session
-                   :id id :trace (expand-file-name trace)
-                   :title (file-name-nondirectory
-                           (directory-file-name (expand-file-name trace)))
-                   :mode (plist-get result :mode)
-                   :layout (plist-get result :layout)
-                   :graphics (plist-get result :graphics))))
-    (puthash id session codetracer--sessions)
-    (when-let ((pos (gethash id codetracer--early-positions)))
-      (setf (codetracer-session-position session) pos)
-      (remhash id codetracer--early-positions))
-    (setq codetracer--active-session id)
+         (session (codetracer--new-session (expand-file-name trace) result)))
+    (setq codetracer--active-session (codetracer-session-id session))
     (codetracer--fetch-sources session)
     (codetracer--watch-sources session)
     (codetracer--select-tab session)
@@ -468,7 +533,69 @@ that waited there could run while another waits, out of order."
     ;; that the session's windows exist.
     (when-let ((pos (codetracer-session-position session)))
       (codetracer--show-position session pos))
+    (codetracer--sync-source-keys)
     session))
+
+(defun codetracer--trace-title (trace)
+  "The title of the recording TRACE when the server gives none.
+It is the name of the recording's folder."
+  (file-name-nondirectory (directory-file-name trace)))
+
+(defun codetracer--new-session (trace result)
+  "Register the session RESULT describes, on the recording TRACE.
+RESULT is the answer to `session/open', or a `session/opened'
+notification: `session', `mode', `layout', `graphics', and `title'.
+What arrived for the session before it was registered is applied now:
+its position, and its keymaps and controls."
+  (let* ((id (plist-get result :session))
+         (title (plist-get result :title))
+         (session (codetracer--make-session
+                   :id id :trace trace
+                   :title (if (and (stringp title) (not (string-empty-p title)))
+                              title
+                            (codetracer--trace-title trace))
+                   :mode (plist-get result :mode)
+                   :layout (plist-get result :layout)
+                   :graphics (plist-get result :graphics))))
+    (puthash id session codetracer--sessions)
+    (when-let ((pos (gethash id codetracer--early-positions)))
+      (setf (codetracer-session-position session) pos)
+      (remhash id codetracer--early-positions))
+    (let ((early (gethash id codetracer--early-notifications)))
+      (remhash id codetracer--early-notifications)
+      (dolist (n (reverse early))
+        (codetracer--dispatch nil (car n) (cdr n))))
+    session))
+
+(defun codetracer--on-session-opened (params)
+  "Show the session PARAMS announces (`session/opened') in a tab of its own.
+The server opened it itself: a test recorded from the Test Results
+pane, a Nim trace.  With `replaces' (the \"current tab\" placement), the
+session it replaces is closed once the new one is shown.  This runs as
+a notification: what it asks the server is sent without waiting."
+  (let ((id (plist-get params :session))
+        (trace (plist-get params :trace)))
+    (when (and id (stringp trace) (not (codetracer--session id)))
+      (let ((session (codetracer--new-session trace params)))
+        (codetracer--send :session/files `(:session ,id)
+                          (lambda (files)
+                            (when (eq (codetracer--session id) session)
+                              (setf (codetracer-session-sources session) (append files nil))
+                              (codetracer--watch-sources session)
+                              ;; Emacs's file tree lists the sources it now has.
+                              (when (and (eq codetracer-panels-file-tree 'editor)
+                                         (eq (codetracer--current-tab-session) session))
+                                (codetracer--realize session)))))
+        (codetracer--select-tab session)
+        (codetracer--activate session)
+        (codetracer--realize session)
+        (when-let ((pos (codetracer-session-position session)))
+          (codetracer--show-position session pos))
+        (when-let ((old (codetracer--session (plist-get params :replaces))))
+          (codetracer--close-session old t))
+        (codetracer--sync-source-keys)
+        (codetracer--sync-controls)
+        (message "CodeTracer: opened %s" (codetracer-session-title session))))))
 
 (defun codetracer-switch-session (id)
   "Show the session ID, in its tab."
@@ -489,11 +616,13 @@ that waited there could run while another waits, out of order."
     (codetracer--send :session/activate
                       `(:session ,(codetracer-session-id session)))))
 
-(defun codetracer--on-tab-selected (_previous _current)
-  "Make the session whose tab the user selected the active one."
+(defun codetracer--on-tab-selected (&rest _)
+  "Make the session whose tab the user selected the active one.
+The debugger keys follow the tab, whoever selected it."
   (unless codetracer--realizing
     (when-let ((session (codetracer--current-tab-session)))
-      (codetracer--activate session))))
+      (codetracer--activate session)))
+  (codetracer--sync-source-keys))
 
 (defun codetracer-close-session (id)
   "Close the session ID and its tab."
@@ -501,7 +630,16 @@ that waited there could run while another waits, out of order."
                            (codetracer-session-id s))
                          (user-error "This tab shows no CodeTracer session"))))
   (when-let ((session (codetracer--session id)))
-    (codetracer--request :session/close `(:session ,id))
+    (codetracer--close-session session)))
+
+(defun codetracer--close-session (session &optional no-wait)
+  "Close SESSION and its tab.
+With NO-WAIT, `session/close' is sent without waiting for its answer,
+as a notification handler must."
+  (let ((id (codetracer-session-id session)))
+    (if no-wait
+        (codetracer--send :session/close `(:session ,id))
+      (codetracer--request :session/close `(:session ,id)))
     (maphash (lambda (_pane buffer) (when (buffer-live-p buffer) (kill-buffer buffer)))
              (codetracer-session-panes session))
     (codetracer--clear-decorations session)
@@ -511,7 +649,9 @@ that waited there could run while another waits, out of order."
       (setq codetracer--active-session nil))
     (when-let ((index (tab-bar--tab-index-by-name (codetracer-session-tab session))))
       (let ((codetracer--realizing t))
-        (tab-bar-close-tab (1+ index))))))
+        (tab-bar-close-tab (1+ index))))
+    (codetracer--sync-source-keys)
+    (codetracer--sync-controls)))
 
 (defun codetracer-quit ()
   "Close every session and stop the pane server."
@@ -1043,7 +1183,10 @@ the pane was closed meanwhile."
                                (setq codetracer--window-change-timer nil)
                                (when (frame-live-p frame)
                                  (codetracer--on-window-buffer-change frame)
-                                 (codetracer--on-window-size-change frame)))))))
+                                 (codetracer--on-window-size-change frame)
+                                 ;; The source window may show another buffer.
+                                 (with-selected-frame frame
+                                   (codetracer--sync-source-keys))))))))
 
 (defun codetracer--on-window-size-change (frame)
   "Report FRAME's pane windows whose sizes changed, and the user's layout."
@@ -1432,8 +1575,11 @@ Run this after changing `codetracer-pane-user-map' or
     codetracer-pane-mode-map)))
 
 (defun codetracer--on-pane-keymap (params)
-  "Install the bindings of PARAMS, a `pane/keymap' notification."
+  "Install the bindings of PARAMS, a `pane/keymap' notification.
+The `editor' pane's are the source buffer's (`codetracer-source-mode')."
   (when-let* ((session (codetracer--session (plist-get params :session)))
+              ((not (and (equal (plist-get params :pane) "editor")
+                         (codetracer--on-editor-keymap session params))))
               (buffer (codetracer--pane-buffer session (plist-get params :pane))))
     (with-current-buffer buffer
       (let ((map (make-sparse-keymap)))
@@ -1445,6 +1591,246 @@ Run this after changing `codetracer-pane-user-map' or
                                    (plist-get binding :operation))))))
         (setq codetracer--server-map map)
         (codetracer--install-local-map)))))
+
+;;;; Debugger controls
+
+;; The debugger controls -- reverse and forward next, step in, step out and
+;; continue, run to entry, stop -- are the server's (`controls/state'), the
+;; ones CodeTracer's terminal draws in its top bar, in the same order.  They
+;; are drawn at the right of the tab bar while a session's tab is current: the
+;; tab bar is the row Emacs already shows for the sessions' tabs, so the
+;; controls cost no window line and do not repeat in every source window.  A
+;; click on one runs its operation; one that cannot act now is dimmed and does
+;; nothing.
+
+(defvar codetracer--tab-bar-format-taken nil
+  "When CodeTracer added its item to `tab-bar-format': (BEFORE . AFTER).
+BEFORE is the format it replaced, AFTER the one it set; nil otherwise.")
+
+(defvar codetracer--tab-bar-format-offered nil
+  "Non-nil once the user was told how to add the controls to their format.")
+
+(defun codetracer--default-tab-bar-format-p ()
+  "Non-nil when `tab-bar-format' is Emacs's default."
+  (equal tab-bar-format (eval (car (get 'tab-bar-format 'standard-value)) t)))
+
+(defun codetracer--sync-controls ()
+  "Take `tab-bar-format' for the controls while sessions are open.
+It is given back when the last one closes.  The format is taken only
+when it is Emacs's default, and given back only when it is still what
+CodeTracer set."
+  (if (and (eq codetracer-controls 'tab-bar)
+           (> (hash-table-count codetracer--sessions) 0))
+      (cond ((or codetracer--tab-bar-format-taken
+                 (memq 'codetracer-tab-bar-controls tab-bar-format)))
+            ((codetracer--default-tab-bar-format-p)
+             (let ((after (append tab-bar-format
+                                  '(tab-bar-format-align-right codetracer-tab-bar-controls))))
+               (setq codetracer--tab-bar-format-taken (cons tab-bar-format after)
+                     tab-bar-format after)))
+            ((not codetracer--tab-bar-format-offered)
+             (setq codetracer--tab-bar-format-offered t)
+             (message "CodeTracer: %s"
+                      (substitute-command-keys
+                       "add `codetracer-tab-bar-controls' to your `tab-bar-format' \
+to show the debugger controls"))))
+    (when codetracer--tab-bar-format-taken
+      (when (equal tab-bar-format (cdr codetracer--tab-bar-format-taken))
+        (setq tab-bar-format (car codetracer--tab-bar-format-taken)))
+      (setq codetracer--tab-bar-format-taken nil)))
+  (force-mode-line-update t))
+
+(defun codetracer--on-controls-state (params)
+  "Keep the controls PARAMS, a `controls/state' notification, sends."
+  (when-let ((session (codetracer--session (plist-get params :session))))
+    (setf (codetracer-session-controls session) (append (plist-get params :buttons) nil))
+    (codetracer--sync-controls)))
+
+(defun codetracer--control-glyph (button)
+  "Return BUTTON's glyph, the one `codetracer-controls-glyphs' names."
+  (let ((glyph (plist-get (plist-get button :glyphs)
+                          (intern (format ":%s" codetracer-controls-glyphs)))))
+    (if (and (stringp glyph) (not (string-empty-p glyph)))
+        glyph
+      (plist-get button :label))))
+
+(defun codetracer--control-enabled-p (button)
+  "Non-nil when BUTTON can act now."
+  (eq (plist-get button :enabled) t))
+
+(defun codetracer--control-command (session button)
+  "Return the command of SESSION's BUTTON: its operation, on SESSION."
+  (let ((operation (plist-get button :operation))
+        (id (codetracer-session-id session)))
+    (lambda ()
+      (interactive)
+      (codetracer--run operation :session id))))
+
+(defun codetracer-tab-bar-controls ()
+  "The current tab's debugger controls, as `tab-bar-format' items.
+Nothing outside a session's tab.  Each control that can act is a
+button running its operation; one that cannot is dimmed and inert.
+Put this function in `tab-bar-format', after
+`tab-bar-format-align-right', when you keep a format of your own
+\(see `codetracer-controls')."
+  (when-let ((session (codetracer--current-tab-session)))
+    (mapcar (lambda (button)
+              (let ((enabled (codetracer--control-enabled-p button)))
+                `(,(intern (format "codetracer-control-%s" (plist-get button :id)))
+                  menu-item
+                  ,(propertize (format " %s " (codetracer--control-glyph button))
+                               'face (if enabled 'codetracer-control
+                                       'codetracer-control-disabled))
+                  ,(if enabled (codetracer--control-command session button) #'ignore)
+                  :help ,(or (plist-get button :tooltip) (plist-get button :label)))))
+            (codetracer-session-controls session))))
+
+;;;; Debugger keys in source buffers
+
+;; In the session's source buffer, while its tab is current, the function-key
+;; bindings of the debugger operations in the user's CodeTracer keymap (the
+;; `editor' pane's `pane/keymap') are bound: F10 steps over where the code is
+;; read, not only in CodeTracer's panes.  Only function-key chords: a
+;; printable key or a C- chord is one of Emacs's own commands, and CodeTracer's
+;; own text editing keys are not wanted in an Emacs buffer.  The keys live in
+;; `codetracer-source-mode', a buffer-local minor mode, so `describe-key' and
+;; `describe-mode' show them; each binding gives way, at the moment the key
+;; is pressed, to any binding the buffer has without the mode other than one
+;; of Emacs's own defaults.
+
+(defconst codetracer--emacs-function-keys
+  '(("<f1>" . help-command) ("<f2>" . 2C-command)
+    ("<f3>" . kmacro-start-macro-or-insert-counter)
+    ("<f4>" . kmacro-end-or-call-macro)
+    ("<f10>" . menu-bar-open) ("<f11>" . toggle-frame-fullscreen)
+    ("S-<f10>" . context-menu-open) ("C-<f10>" . buffer-menu-open)
+    ("M-<f10>" . toggle-frame-maximized))
+  "The function keys `emacs -Q' binds, and to what (Emacs 29 and 30).
+A source buffer's debugger key takes the place of these; any other
+binding of the key is the user's, and wins.")
+
+(defvar codetracer-source-mode-map (make-sparse-keymap)
+  "The keymap of `codetracer-source-mode'.
+Each buffer's keys are its session's; they are installed with
+`minor-mode-overriding-map-alist', so this map stays empty.")
+
+(define-minor-mode codetracer-source-mode
+  "CodeTracer's debugger keys in a session's source buffer.
+The package turns it on in the source buffer of the session whose tab is
+current, and off when the tab is left, the window shows another buffer,
+or `codetracer-source-keys' is nil.  The keys are the function-key
+bindings of the debugger operations in your CodeTracer keymap; a key
+you bind yourself wins."
+  :lighter " CT"
+  :keymap codetracer-source-mode-map)
+
+(defvar codetracer--source-key-buffers nil
+  "The buffers in which `codetracer-source-mode' carries a session's keys.")
+
+(defvar-local codetracer--source-keys-of nil
+  "In a source buffer with CodeTracer's keys: (SESSION-ID . BINDINGS).")
+
+(defun codetracer--source-key-p (key operation)
+  "Non-nil when KEY for OPERATION may be bound in a source buffer.
+KEY is in Emacs's spelling.  The debugger's operations and the
+breakpoint and tracepoint toggles, on function-key chords only."
+  (and (stringp key) (stringp operation)
+       (string-match-p "\\`\\(?:[ACHMSs]-\\)*<f[0-9]+>\\'" key)
+       (or (string-prefix-p "debugger." operation)
+           (member operation '("editor.toggle-breakpoint" "editor.toggle-tracepoint")))))
+
+(defun codetracer--source-bindings (bindings)
+  "The keys of BINDINGS (a `pane/keymap''s) for a source buffer.
+A list of (EMACS-KEY . OPERATION), the first binding of a key winning.
+A key the editor already binds there (`shadowedBy') is left out."
+  (let (out)
+    (seq-doseq (b bindings)
+      (let ((key (codetracer--emacs-key (or (plist-get b :key) "")))
+            (operation (plist-get b :operation)))
+        (when (and key (not (plist-get b :shadowedBy))
+                   (codetracer--source-key-p key operation)
+                   (not (assoc key out)))
+          (push (cons key operation) out))))
+    (nreverse out)))
+
+(defun codetracer--on-editor-keymap (session params)
+  "Keep the source keys of PARAMS for SESSION.
+PARAMS is the `editor' pane's `pane/keymap'.  Return non-nil: the
+`editor' pane has no buffer of its own."
+  (setf (codetracer-session-source-bindings session)
+        (codetracer--source-bindings (plist-get params :bindings)))
+  ;; Rebound with the new keys.
+  (dolist (b codetracer--source-key-buffers)
+    (when (buffer-live-p b)
+      (with-current-buffer b (setq codetracer--source-keys-of nil))))
+  (codetracer--sync-source-keys)
+  t)
+
+(defun codetracer--user-binding (key)
+  "The binding of KEY in this buffer, without `codetracer-source-mode'.
+Nil when there is none, or when it is one of Emacs's own defaults."
+  (let* ((codetracer-source-mode nil)
+         (binding (key-binding (kbd key))))
+    (unless (or (null binding)
+                (eq binding (cdr (assoc key codetracer--emacs-function-keys))))
+      binding)))
+
+(defun codetracer--source-keymap (bindings)
+  "The keymap of BINDINGS, (EMACS-KEY . OPERATION) pairs.
+Each key runs its operation's command, unless the buffer binds the key
+otherwise when it is pressed (`codetracer--user-binding')."
+  (let ((map (make-sparse-keymap)))
+    (pcase-dolist (`(,key . ,operation) bindings)
+      (keymap-set map key
+                  `(menu-item ,operation ,(codetracer--operation-command operation)
+                              :filter ,(lambda (command)
+                                         (unless (codetracer--user-binding key)
+                                           command)))))
+    map))
+
+(defun codetracer--bind-source-keys (session buffer)
+  "Turn on `codetracer-source-mode' in BUFFER, with SESSION's keys."
+  (with-current-buffer buffer
+    (let ((keys (cons (codetracer-session-id session)
+                      (codetracer-session-source-bindings session))))
+      (unless (and codetracer-source-mode (equal codetracer--source-keys-of keys))
+        (setq-local minor-mode-overriding-map-alist
+                    (cons (cons 'codetracer-source-mode
+                                (codetracer--source-keymap (cdr keys)))
+                          (assq-delete-all 'codetracer-source-mode
+                                           (copy-sequence minor-mode-overriding-map-alist))))
+        (setq codetracer--source-keys-of keys)
+        (codetracer-source-mode 1))))
+  (cl-pushnew buffer codetracer--source-key-buffers))
+
+(defun codetracer--unbind-source-keys (buffer)
+  "Turn off `codetracer-source-mode' in BUFFER and drop its keys."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (codetracer-source-mode -1)
+      (setq-local minor-mode-overriding-map-alist
+                  (assq-delete-all 'codetracer-source-mode
+                                   (copy-sequence minor-mode-overriding-map-alist)))
+      (setq codetracer--source-keys-of nil)))
+  (setq codetracer--source-key-buffers (delq buffer codetracer--source-key-buffers)))
+
+(defun codetracer--sync-source-keys ()
+  "Bind the debugger keys in the current tab's source buffer, and nowhere else.
+The source buffer is the buffer of the current tab's session's source
+window, when it is a source: a file, or a source read from the recording."
+  (let* ((session (and codetracer-source-keys (codetracer--current-tab-session)))
+         (window (and session (codetracer-session-source-bindings session)
+                      (codetracer--source-window session)))
+         (buffer (and (window-live-p window) (window-buffer window)))
+         (keep (and buffer
+                    (with-current-buffer buffer
+                      (or buffer-file-name codetracer--recorded-path))
+                    buffer)))
+    (dolist (b (copy-sequence codetracer--source-key-buffers))
+      (unless (eq b keep)
+        (codetracer--unbind-source-keys b)))
+    (when keep
+      (codetracer--bind-source-keys session keep))))
 
 ;;;; Source buffers
 
@@ -1495,7 +1881,8 @@ window when it is not a side window, else any live window that is not."
           (move-to-column (max 0 (1- (or (plist-get pos :column) 1))))
           (set-window-point window (point))
           (codetracer--mark-execution session buffer (line-beginning-position)))
-        (codetracer--report-source-viewport session window)))))
+        (codetracer--report-source-viewport session window)
+        (codetracer--sync-source-keys)))))
 
 (defun codetracer--mark-execution (session buffer pos)
   "Mark the execution line at POS in BUFFER for SESSION."
@@ -1766,7 +2153,8 @@ Emacs's own lock, backup and auto-save files are not the user's files."
     (let ((window (codetracer--source-window session))
           (codetracer--realizing t))
       (set-window-dedicated-p window nil)
-      (set-window-buffer window buffer))))
+      (set-window-buffer window buffer)
+      (codetracer--sync-source-keys))))
 
 ;;;; Desktop
 
@@ -1832,18 +2220,9 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (unless (codetracer--live-p)
     (codetracer--start-server))
   (let* ((result (codetracer--request :session/open `(:trace ,trace)))
-         (id (plist-get result :session))
-         (session (codetracer--make-session
-                   :id id :trace trace
-                   :title (file-name-nondirectory (directory-file-name trace))
-                   :mode (plist-get result :mode)
-                   :layout (plist-get result :layout)
-                   :graphics (plist-get result :graphics)))
+         (session (codetracer--new-session trace result))
+         (id (codetracer-session-id session))
          (old-tab (plist-get misc :tab)))
-    (puthash id session codetracer--sessions)
-    (when-let ((pos (gethash id codetracer--early-positions)))
-      (setf (codetracer-session-position session) pos)
-      (remhash id codetracer--early-positions))
     (setq codetracer--active-session id)
     (codetracer--fetch-sources session)
     (codetracer--watch-sources session)
@@ -1884,6 +2263,7 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (add-hook 'window-buffer-change-functions #'codetracer--schedule-window-change)
   (add-hook 'window-scroll-functions #'codetracer--on-window-scroll)
   (add-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
+  (add-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
   (add-hook 'post-command-hook #'codetracer--report-cursor))
 
 (defun codetracer--remove-hooks ()
@@ -1892,9 +2272,28 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (remove-hook 'window-buffer-change-functions #'codetracer--schedule-window-change)
   (remove-hook 'window-scroll-functions #'codetracer--on-window-scroll)
   (remove-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
+  (remove-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
   (remove-hook 'post-command-hook #'codetracer--report-cursor))
 
 ;;;; Commands most people bind
+
+;; Every operation of the server's catalogue becomes a command when the server
+;; starts (`codetracer--define-operation-commands').  The debugger's are also
+;; defined when the package loads, so they can be bound before a session is
+;; open: `codetracer-debugger-step-over' and the rest, and the short names
+;; below.
+
+(defconst codetracer--debugger-operations
+  '("debugger.continue" "debugger.reverse-continue"
+    "debugger.step-over" "debugger.reverse-step-over"
+    "debugger.step-into" "debugger.reverse-step-into"
+    "debugger.step-out" "debugger.reverse-step-out"
+    "debugger.run-to-entry" "debugger.stop" "debugger.restart"
+    "editor.toggle-breakpoint" "editor.toggle-tracepoint")
+  "The debugger operations offered as commands before the server starts.")
+
+(dolist (operation codetracer--debugger-operations)
+  (codetracer--operation-command operation))
 
 (defun codetracer-step-over ()
   "Step over, to the next line."
@@ -1925,6 +2324,38 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   "Continue backwards to the previous breakpoint."
   (interactive)
   (codetracer--run "debugger.reverse-continue"))
+
+(defun codetracer-reverse-step-into ()
+  "Step back into the call that returned to this line."
+  (interactive)
+  (codetracer--run "debugger.reverse-step-into"))
+
+(defun codetracer-reverse-step-out ()
+  "Step back out, to the line that called the current function."
+  (interactive)
+  (codetracer--run "debugger.reverse-step-out"))
+
+(defun codetracer-run-to-entry ()
+  "Go to the recording's entry point."
+  (interactive)
+  (codetracer--run "debugger.run-to-entry"))
+
+(defun codetracer-stop ()
+  "Stop debugging and return to editing."
+  (interactive)
+  (codetracer--run "debugger.stop"))
+
+(defun codetracer-toggle-breakpoint ()
+  "Toggle a breakpoint on the line point is on in the source window."
+  (interactive)
+  (codetracer--report-cursor)
+  (codetracer--run "editor.toggle-breakpoint"))
+
+(defun codetracer-toggle-tracepoint ()
+  "Toggle a tracepoint on the line point is on in the source window."
+  (interactive)
+  (codetracer--report-cursor)
+  (codetracer--run "editor.toggle-tracepoint"))
 
 (defun codetracer-toggle-mode ()
   "Switch the session between its debug and edit modes."
