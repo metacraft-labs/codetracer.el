@@ -30,6 +30,9 @@ or named by `codetracer-server-program`.
   first. Resizing or closing a pane is kept in that mode's layout:
   switching to the other mode and back (`codetracer-toggle-mode`) brings
   your arrangement back.
+- Pane buffers are named `ct://SESSION/PANE` (`ct://1/calltrace`). A
+  window showing one of several stacked panes lists them in its header
+  line, the shown one highlighted; click a name to show that pane there.
 - In a pane, the keys are your CodeTracer keymap's for that pane. Your own
   bindings in `codetracer-pane-user-map` (every pane) or
   `codetracer-pane-user-maps` (one pane) win over them; run

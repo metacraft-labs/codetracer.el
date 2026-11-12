@@ -157,6 +157,10 @@ Nil means all it can draw: text, and images when `display-images-p'."
   "The fringe mark of a tracepoint.")
 (defface codetracer-execution-fringe '((t :inherit success))
   "The fringe arrow on the execution line.")
+(defface codetracer-stack-tab '((t :inherit shadow))
+  "The name of a stacked pane its window does not show, in the window's tabs.")
+(defface codetracer-stack-tab-active '((t :inherit (highlight bold)))
+  "The name of the stacked pane its window shows, in the window's tabs.")
 
 (defcustom codetracer-style-faces
   '(("chrome-text" . codetracer-chrome)
@@ -231,7 +235,14 @@ else unstyled."
   id trace title mode layout tab graphics realized sources watches
   (panes (make-hash-table :test #'equal))
   position
-  (decorations (make-hash-table :test #'equal)))
+  (decorations (make-hash-table :test #'equal))
+  ;; A sizes-only `layout/edited' awaits its answer, and the windows were
+  ;; resized again meanwhile (see `codetracer--report-layout').
+  reporting sizes-dirty
+  ;; The stacked panes the user picked from a window's tabs, as
+  ;; (MODE . STACK-PATH) -> child index: the server's layouts do not carry
+  ;; them, so they are applied to each layout it sends.
+  (stack-choices (make-hash-table :test #'equal)))
 
 (defvar codetracer--connection nil
   "The `jsonrpc-process-connection' to the pane server, or nil.")
@@ -272,6 +283,9 @@ Window changes made then are not the user's edits.")
 (defvar-local codetracer--pane-size nil
   "In a pane buffer, the (WIDTH . HEIGHT) last sent to the server.")
 
+(defvar-local codetracer--pane-resizing nil
+  "In a pane buffer, non-nil while a `pane/resize' awaits its answer.")
+
 (defvar-local codetracer--pane-open nil
   "In a pane buffer, non-nil once the server was told it is open.")
 
@@ -310,8 +324,10 @@ Window changes made then are not the user's edits.")
   (jsonrpc-request (codetracer--connection) method (or params '())
                    :timeout codetracer-request-timeout))
 
-(defun codetracer--send (method &optional params on-result)
+(defun codetracer--send (method &optional params on-result on-failure)
   "Send METHOD with PARAMS without waiting; ON-RESULT receives its result.
+ON-FAILURE, when given, is called with no argument when the request
+fails or times out instead.  Return non-nil when the request was sent.
 For requests made from notification handlers, hooks and timers:
 `jsonrpc' dispatches the server's messages from timers, and a request
 that waited there could run while another waits, out of order."
@@ -320,8 +336,13 @@ that waited there could run while another waits, out of order."
                            :success-fn (or on-result #'ignore)
                            :error-fn (lambda (err)
                                        (message "CodeTracer: %s failed: %s"
-                                                method (plist-get err :message)))
-                           :timeout codetracer-request-timeout)))
+                                                method (plist-get err :message))
+                                       (when on-failure (funcall on-failure)))
+                           :timeout-fn (lambda ()
+                                         (message "CodeTracer: %s timed out" method)
+                                         (when on-failure (funcall on-failure)))
+                           :timeout codetracer-request-timeout)
+    t))
 
 (defun codetracer--notify (method &optional params)
   "Send the notification METHOD with PARAMS to the pane server."
@@ -594,12 +615,39 @@ side's fraction of the frame across it, PANE-LIST its panes as
                              (codetracer--visible-leaves kid (list i) 1.0)
                              (list i))))))
 
+(defun codetracer--pane-buffer-name (id pane)
+  "The name of the buffer showing session ID's PANE: ct://ID/PANE.
+Short on purpose: it is what the mode line shows, and pane windows are
+narrow, so a long name leaves no room for the pane's."
+  (format "ct://%s/%s" id pane))
+
+(defun codetracer--legacy-pane-buffer-name (id pane)
+  "The name session ID's PANE buffer had before `ct://' names.
+A `desktop' file saved then restores the buffer under it."
+  (format "*codetracer %s: %s*" id pane))
+
+(defun codetracer--named-pane-buffer (id pane)
+  "The buffer named for session ID's PANE, created when there is none.
+A buffer carrying the name pane buffers had before (one `desktop'
+restored, say) is adopted and renamed, so no buffer is left answering
+to the old name; when both names are taken, the old one goes."
+  (let* ((name (codetracer--pane-buffer-name id pane))
+         (current (get-buffer name))
+         (legacy (get-buffer (codetracer--legacy-pane-buffer-name id pane))))
+    (cond ((and current legacy)
+           (kill-buffer legacy)
+           current)
+          (current current)
+          (legacy
+           (with-current-buffer legacy (rename-buffer name))
+           legacy)
+          (t (get-buffer-create name)))))
+
 (defun codetracer--pane-buffer (session pane)
   "SESSION's buffer for PANE, created when it does not exist."
   (let ((buffer (gethash pane (codetracer-session-panes session))))
     (unless (buffer-live-p buffer)
-      (setq buffer (get-buffer-create
-                    (format "*codetracer %s: %s*" (codetracer-session-id session) pane)))
+      (setq buffer (codetracer--named-pane-buffer (codetracer-session-id session) pane))
       (with-current-buffer buffer
         (codetracer-pane-mode)
         (setq codetracer--pane pane
@@ -634,10 +682,7 @@ side's fraction of the frame across it, PANE-LIST its panes as
         (dolist (leaf leaves)
           (cl-incf slot)
           (let* ((pane (nth 0 leaf))
-                 (buffer (if (and (equal pane "fileTree")
-                                  (eq codetracer-panels-file-tree 'editor))
-                             (codetracer--file-tree-buffer session)
-                           (codetracer--pane-buffer session pane)))
+                 (buffer (codetracer--leaf-buffer session pane))
                  (window (display-buffer
                           buffer
                           `((display-buffer-in-side-window)
@@ -652,19 +697,32 @@ side's fraction of the frame across it, PANE-LIST its panes as
               (push (cons window leaf) shown))))
         (codetracer--apply-shares where leaves)))
     ;; Panes the server keeps open that this layout does not show.
-    (maphash (lambda (pane buffer)
-               (when (and (buffer-live-p buffer)
-                          (buffer-local-value 'codetracer--pane-open buffer)
-                          (not (get-buffer-window buffer)))
-                 (with-current-buffer buffer (setq codetracer--pane-open nil
-                                                   codetracer--pane-size nil))
-                 (codetracer--send :pane/close
-                                   `(:session ,(codetracer-session-id session)
-                                              :pane ,pane))))
+    (maphash (lambda (_pane buffer)
+               (when (and (buffer-live-p buffer) (not (get-buffer-window buffer)))
+                 (codetracer--close-pane buffer)))
              (codetracer-session-panes session))
+    ;; The tabs change the windows' body heights: before the sizes are sent.
+    (codetracer--update-stack-tabs session)
     (dolist (entry shown)
-      (codetracer--sync-pane-size (car entry) 'open))
+      (codetracer--sync-pane-size (car entry)))
     shown))
+
+(defun codetracer--leaf-buffer (session pane)
+  "The buffer showing SESSION's PANE: the pane's, or the role Emacs fills."
+  (if (and (equal pane "fileTree") (eq codetracer-panels-file-tree 'editor))
+      (codetracer--file-tree-buffer session)
+    (codetracer--pane-buffer session pane)))
+
+(defun codetracer--close-pane (buffer)
+  "Tell the server that the pane in BUFFER is no longer shown, if it was open.
+A `pane/resize' still awaiting its answer is not followed by another:
+the answer finds the pane closed (`codetracer--resize-answered')."
+  (with-current-buffer buffer
+    (when (and codetracer--pane codetracer--pane-open)
+      (setq codetracer--pane-open nil
+            codetracer--pane-size nil)
+      (codetracer--send :pane/close `(:session ,codetracer--pane-session
+                                               :pane ,codetracer--pane)))))
 
 (defun codetracer--apply-shares (side pane-list)
   "Resize the slots of SIDE to the shares in PANE-LIST."
@@ -688,7 +746,9 @@ side's fraction of the frame across it, PANE-LIST its panes as
   "The server's layout for a session's mode: PARAMS."
   (when-let ((session (codetracer--session (plist-get params :session))))
     (setf (codetracer-session-mode session) (plist-get params :mode)
-          (codetracer-session-layout session) (plist-get params :layout))
+          (codetracer-session-layout session)
+          (codetracer--apply-stack-choices session (plist-get params :layout)
+                                           (plist-get params :mode)))
     (when (eq (codetracer--current-tab-session) session)
       (codetracer--show-layout session))))
 
@@ -708,11 +768,169 @@ is realized."
   (let ((windows (codetracer--session-windows session)))
     (if (and windows (equal (codetracer-session-realized session)
                             (codetracer-session-layout session)))
-        (dolist (w windows) (codetracer--sync-pane-size w 'open))
+        (progn
+          (codetracer--update-stack-tabs session)
+          (dolist (w windows) (codetracer--sync-pane-size w)))
       (codetracer--realize session))))
 
+;;;; Stacked panes
+
+;; A stack shows one of its children at a time.  The window showing a
+;; stacked pane lists the stack's children in its header line, the shown
+;; one in `codetracer-stack-tab-active'; a click on a name shows that pane
+;; in the window.  The choice is the editor's: the server's layouts keep
+;; their own `activeIndex', so the choice is applied to every layout of
+;; that mode the server sends.
+
+(defvar codetracer-stack-tab-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'codetracer-stack-tab-click)
+    map)
+  "The keymap on a stacked pane's name in its window's tabs.")
+
+(defun codetracer--node-at (layout path)
+  "The node of LAYOUT at PATH (child indices from the root), or nil."
+  (let ((node layout))
+    (dolist (i path node)
+      (setq node (and node (nth i (codetracer--node-children node)))))))
+
+(defun codetracer--stack-active (stack)
+  "The index of STACK's shown child among its children."
+  (min (max 0 (or (plist-get stack :activeIndex) 0))
+       (max 0 (1- (length (codetracer--node-children stack))))))
+
+(defun codetracer--stack-tabs (stack)
+  "STACK's tabs: one clickable name per child, as a header line."
+  (let ((active (codetracer--stack-active stack))
+        (i -1))
+    (mapconcat (lambda (child)
+                 (cl-incf i)
+                 (propertize (format " %s " (string-replace
+                                             "%" "%%"
+                                             (if (equal (codetracer--node-kind child) "pane")
+                                                 (codetracer--node-pane child)
+                                               (codetracer--node-kind child))))
+                             'face (if (= i active)
+                                       'codetracer-stack-tab-active
+                                     'codetracer-stack-tab)
+                             'mouse-face 'mode-line-highlight
+                             'help-echo "mouse-1: show this pane"
+                             'keymap codetracer-stack-tab-map
+                             'codetracer-stack-index i))
+               (codetracer--node-children stack) "")))
+
+(defun codetracer--update-stack-tabs (session)
+  "Give each window showing one of several stacked panes of SESSION its tabs.
+The window remembers the stack's path, in its `codetracer-stack'
+parameter (a vector), for a click on a tab."
+  (let ((layout (codetracer-session-layout session)))
+    (dolist (side (codetracer--sides layout))
+      (dolist (leaf (nth 2 side))
+        (when-let* ((buffer (gethash (nth 0 leaf) (codetracer-session-panes session)))
+                    ((buffer-live-p buffer))
+                    (window (get-buffer-window buffer)))
+          (let* ((region (nth 3 leaf))
+                 (node (codetracer--node-at layout region))
+                 (stack (and (equal (codetracer--node-kind node) "stack")
+                             (> (length (codetracer--node-children node)) 1)
+                             node)))
+            (set-window-parameter window 'codetracer-stack (and stack (vconcat region)))
+            (with-current-buffer buffer
+              (setq header-line-format (and stack (codetracer--stack-tabs stack))))))))))
+
+(defun codetracer--apply-stack-choices (session layout mode)
+  "Show, in SESSION's LAYOUT of MODE, the stacked panes the user picked.
+Return LAYOUT, changed in place."
+  (when layout
+    (maphash (lambda (key index)
+               (when (equal (car key) mode)
+                 (let ((node (codetracer--node-at layout (cdr key))))
+                   (when (and (equal (codetracer--node-kind node) "stack")
+                              (< index (length (codetracer--node-children node))))
+                     (plist-put node :activeIndex index)))))
+             (codetracer-session-stack-choices session)))
+  layout)
+
+(defun codetracer--stack-select (session window index)
+  "Show child INDEX of the stack whose pane SESSION's WINDOW displays.
+When both the shown child and child INDEX are panes, the window
+changes buffer and keeps its size; otherwise the layout is realized
+again."
+  (let* ((path (append (window-parameter window 'codetracer-stack) nil))
+         (layout (codetracer-session-layout session))
+         (stack (and (window-parameter window 'codetracer-stack)
+                     (codetracer--node-at layout path)))
+         (kids (and stack (codetracer--node-children stack)))
+         (before (and kids (nth (codetracer--stack-active stack) kids)))
+         (after (and kids (nth index kids))))
+    (when (and (equal (codetracer--node-kind stack) "stack") after
+               (not (eq before after)))
+      (puthash (cons (codetracer-session-mode session) path) index
+               (codetracer-session-stack-choices session))
+      (codetracer--apply-stack-choices session layout (codetracer-session-mode session))
+      (unless (eq (codetracer-session-realized session) layout)
+        (codetracer--apply-stack-choices session (codetracer-session-realized session)
+                                         (codetracer-session-mode session)))
+      (if (not (and (equal (codetracer--node-kind before) "pane")
+                    (equal (codetracer--node-kind after) "pane")
+                    (codetracer--servable-p (codetracer--node-pane after))))
+          (codetracer--realize session)
+        (let ((codetracer--realizing t)
+              (old (window-buffer window))
+              (buffer (codetracer--leaf-buffer session (codetracer--node-pane after))))
+          (codetracer--close-pane old)
+          (with-current-buffer old (setq header-line-format nil))
+          (set-window-dedicated-p window nil)
+          (set-window-buffer window buffer)
+          (set-window-dedicated-p window t)
+          (codetracer--update-stack-tabs session)
+          (codetracer--sync-pane-size window))))))
+
+(defun codetracer-stack-tab-click (event)
+  "Show the stacked pane whose name EVENT clicked in a window's tabs."
+  (interactive "e")
+  (let* ((posn (event-start event))
+         (window (posn-window posn))
+         (object (posn-string posn))
+         (index (and (consp object) (stringp (car object)) (integerp (cdr object))
+                     (get-text-property (cdr object) 'codetracer-stack-index
+                                        (car object))))
+         (session (and (window-live-p window)
+                       (codetracer--session (buffer-local-value 'codetracer--pane-session
+                                                                (window-buffer window))))))
+    (when (and session index)
+      (codetracer--stack-select session window index))))
+
 (defun codetracer--report-layout (session)
-  "Report the user's sizes of SESSION's windows as the mode's layout weights."
+  "Report the user's sizes of SESSION's windows as the mode's layout weights.
+At most one such report is in flight: dragging a divider resizes the
+windows once per mouse motion, faster than the server answers, and each
+report would queue behind the last.  A resize made while one is pending
+is reported when its answer arrives, measured then, so the last report
+carries the sizes the windows ended at.  A pane closed is reported at
+once all the same (`codetracer--report-closed')."
+  (if (codetracer-session-reporting session)
+      (setf (codetracer-session-sizes-dirty session) t)
+    (setf (codetracer-session-sizes-dirty session) nil)
+    (setf (codetracer-session-reporting session)
+          (codetracer--send :layout/edited (codetracer--measured-layout session)
+                            (lambda (result)
+                              (codetracer--edited session result)
+                              (codetracer--layout-reported session))
+                            (lambda () (codetracer--layout-reported session))))))
+
+(defun codetracer--layout-reported (session)
+  "The server answered SESSION's sizes report: send the next one, if any.
+Only while SESSION's windows are on screen: they are what is measured."
+  (setf (codetracer-session-reporting session) nil)
+  (when (and (codetracer-session-sizes-dirty session)
+             (eq (codetracer--session (codetracer-session-id session)) session)
+             (eq (codetracer--current-tab-session) session)
+             (not codetracer--realizing))
+    (codetracer--report-layout session)))
+
+(defun codetracer--measured-layout (session)
+  "The `layout/edited' parameters for the sizes of SESSION's windows now."
   (let ((weights nil) (sizes nil))
     (dolist (side (codetracer--sides (codetracer-session-layout session)))
       (pcase-let ((`(,where ,_size ,leaves ,path) side))
@@ -747,51 +965,75 @@ is realized."
                                    (window-total-width main)
                                  (window-total-height main)))
               weights)))
-    (codetracer--send :layout/edited
-                      `(:session ,(codetracer-session-id session)
-                                 :mode ,(codetracer-session-mode session)
-                                 :sizes ,(apply #'append (mapcar (lambda (c) (list (car c) (cdr c)))
-                                                                 sizes))
-                                 :weights ,(vconcat weights)
-                                 :closed [])
-                      (lambda (result) (codetracer--edited session result)))))
+    `(:session ,(codetracer-session-id session)
+               :mode ,(codetracer-session-mode session)
+               :sizes ,(apply #'append (mapcar (lambda (c) (list (car c) (cdr c)))
+                                               sizes))
+               :weights ,(vconcat weights)
+               :closed [])))
 
 (defun codetracer--edited (session result)
   "Take the layout RESULT the server recorded for SESSION's user edit.
 It is the arrangement on screen, so it is also the one realized."
-  (when-let ((layout (plist-get result :layout)))
+  (when-let ((layout (codetracer--apply-stack-choices
+                      session (plist-get result :layout) (codetracer-session-mode session))))
     (setf (codetracer-session-layout session) layout
           (codetracer-session-realized session) layout)))
 
-(defun codetracer--report-closed (session pane)
-  "Report that the user closed SESSION's PANE."
+(defun codetracer--report-closed (session pane buffer)
+  "Report that the user closed SESSION's PANE, which BUFFER showed.
+Sent at once, even while a sizes-only report is in flight."
   (codetracer--send :layout/edited
                     `(:session ,(codetracer-session-id session)
                                :mode ,(codetracer-session-mode session)
                                :closed ,(vector pane))
                     (lambda (result) (codetracer--edited session result)))
-  (codetracer--send :pane/close `(:session ,(codetracer-session-id session)
-                                           :pane ,pane)))
+  (codetracer--close-pane buffer))
 
 ;;;; Pane sizes
 
-(defun codetracer--sync-pane-size (window &optional open)
+(defun codetracer--sync-pane-size (window)
   "Tell the server the size of WINDOW's pane, if it changed.
-With OPEN, the pane is opened rather than resized."
+A pane that is not open is opened (`pane/open') at once.  An open one
+is resized (`pane/resize'), with at most one resize in flight: dragging
+a divider resizes the window once per mouse motion, far faster than the
+server repaints, and sending every size between would queue repaints
+the user has already dragged past.  When the answer arrives, the size
+the window has reached by then is sent if it differs
+\(`codetracer--resize-answered'), so the pane trails the divider by at
+most one repaint and the size the drag stops at is the last one sent."
   (let ((buffer (window-buffer window)))
     (with-current-buffer buffer
       (when codetracer--pane
         (let ((size (cons (max 1 (window-body-width window))
-                          (max 1 (window-body-height window)))))
-          (when (or (and open (not codetracer--pane-open))
-                    (not (equal size codetracer--pane-size)))
-            (let ((method (if codetracer--pane-open :pane/resize :pane/open)))
-              (setq codetracer--pane-size size
-                    codetracer--pane-open t)
-              (codetracer--send method
-                                `(:session ,codetracer--pane-session
-                                           :pane ,codetracer--pane
-                                           :width ,(car size) :height ,(cdr size))))))))))
+                          (max 1 (window-body-height window))))
+              (params (lambda (size)
+                        `(:session ,codetracer--pane-session
+                                   :pane ,codetracer--pane
+                                   :width ,(car size) :height ,(cdr size)))))
+          (cond
+           ((not codetracer--pane-open)
+            (setq codetracer--pane-size size
+                  codetracer--pane-open t)
+            (codetracer--send :pane/open (funcall params size)))
+           ((and (not codetracer--pane-resizing)
+                 (not (equal size codetracer--pane-size)))
+            (setq codetracer--pane-size size)
+            (setq codetracer--pane-resizing
+                  (codetracer--send :pane/resize (funcall params size)
+                                    (lambda (_) (codetracer--resize-answered buffer))
+                                    (lambda () (codetracer--resize-answered buffer)))))))))))
+
+(defun codetracer--resize-answered (buffer)
+  "Follow up the answer to the `pane/resize' of the pane in BUFFER.
+Send the size its window has reached since, if it differs; nothing when
+the pane was closed meanwhile."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq codetracer--pane-resizing nil)
+      (when-let* ((codetracer--pane-open)
+                  (window (get-buffer-window buffer t)))
+        (codetracer--sync-pane-size window)))))
 
 (defun codetracer--schedule-window-change (frame)
   "Report what happened to FRAME's windows once redisplay is done."
@@ -828,9 +1070,7 @@ With OPEN, the pane is opened rather than resized."
                  (when (and (buffer-live-p buffer)
                             (buffer-local-value 'codetracer--pane-open buffer)
                             (not (get-buffer-window buffer frame)))
-                   (with-current-buffer buffer
-                     (setq codetracer--pane-open nil codetracer--pane-size nil))
-                   (codetracer--report-closed session pane)))
+                   (codetracer--report-closed session pane buffer)))
                (codetracer-session-panes session)))))
 
 ;;;; Pane content
@@ -986,18 +1226,36 @@ replaces it; otherwise each row replaces the line it indexes."
 ;;;; Operations
 
 (cl-defun codetracer--run (operation &key args pane session)
-  "Run OPERATION on SESSION (the active one when nil).
-ARGS are a hotspot's arguments; PANE is focused first."
-  (let ((result (codetracer--request
-                 :operation/run
-                 `(,@(when session `(:session ,session))
-                   :operation ,operation
-                   ,@(when pane `(:pane ,pane))
-                   ,@(when args `(:args ,args))))))
-    (when (and (called-interactively-p 'any) (plist-get result :detail)
-               (not (string-empty-p (plist-get result :detail))))
-      (message "%s" (plist-get result :detail)))
-    result))
+  "Run OPERATION on SESSION (the active one when nil) and return the result.
+ARGS are a hotspot's arguments; PANE is focused first.  What the server
+says about the run is shown to the user: a refusal (an error answer, or
+`ok' false) as a message naming OPERATION, the answer's `detail' (\"frame
+2 of 5\", the operation's notification) as it is.  A refusal returns nil."
+  (condition-case err
+      (let ((result (codetracer--request
+                     :operation/run
+                     `(,@(when session `(:session ,session))
+                       :operation ,operation
+                       ,@(when pane `(:pane ,pane))
+                       ,@(when args `(:args ,args))))))
+        (codetracer--show-run-result operation result)
+        result)
+    (jsonrpc-error
+     (message "CodeTracer: %s: %s" operation
+              (or (alist-get 'jsonrpc-error-message (cdr err))
+                  (error-message-string err)))
+     nil)))
+
+(defun codetracer--show-run-result (operation result)
+  "Show the user what the server said of running OPERATION: its RESULT."
+  (let ((detail (plist-get result :detail)))
+    (cond ((eq (plist-get result :ok) :json-false)
+           (message "CodeTracer: %s: %s" operation
+                    (if (and (stringp detail) (not (string-empty-p detail)))
+                        detail
+                      "refused")))
+          ((and (stringp detail) (not (string-empty-p detail)))
+           (message "CodeTracer: %s" detail)))))
 
 (defun codetracer--command-name (operation)
   "The `M-x' command for OPERATION, the catalogue's name."
@@ -1013,11 +1271,8 @@ LABEL is its catalogue label, used in the command's documentation."
       (defalias name
         (lambda ()
           (interactive)
-          (let ((result (codetracer--run operation
-                                         :pane codetracer--pane
-                                         :session codetracer--pane-session)))
-            (when-let ((detail (plist-get result :detail)))
-              (unless (string-empty-p detail) (message "%s" detail)))))
+          (codetracer--run operation :pane codetracer--pane
+                           :session codetracer--pane-session))
         (format "Run CodeTracer's %s operation (%s)." operation (or label operation)))
       (put name 'codetracer-operation operation))
     name))
@@ -1606,7 +1861,7 @@ Emacs's own lock, backup and auto-save files are not the user's files."
               codetracer--pane-open nil
               codetracer--pane-size nil
               codetracer--restored nil)
-        (rename-buffer (format "*codetracer %s: %s*" id codetracer--pane) t))
+        (rename-buffer (codetracer--pane-buffer-name id codetracer--pane) t))
       (puthash (buffer-local-value 'codetracer--pane b) b (codetracer-session-panes session)))
     ;; The mode the user left it in.
     (unless (equal (plist-get misc :mode) (codetracer-session-mode session))
@@ -1694,7 +1949,7 @@ can display images, and as a line of text otherwise."
                                             (window-height . 0.4)
                                             (dedicated . t)))))
       (when window
-        (codetracer--sync-pane-size window 'open))
+        (codetracer--sync-pane-size window))
       window)))
 
 (defun codetracer-dap-endpoint ()
