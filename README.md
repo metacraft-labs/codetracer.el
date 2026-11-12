@@ -122,6 +122,24 @@ or named by `codetracer-server-program`.
   `▶ Record <test>` button above each test instead of the fringe mark, or
   to `both`. The marks' faces are `codetracer-test-fringe`,
   `codetracer-test-passed-fringe` and `codetracer-test-failed-fringe`.
+- In a Nim project, CodeTracer traces what the compiler runs: a macro's
+  expansion, a `static:` block, a constant's evaluation, a NimScript run
+  (`nim e`). With `context-menu-mode` on, right-click on the construct in
+  a `.nim` or `.nims` buffer (or one in `nim-mode`) while a session is
+  open: the CodeTracer submenu traces the macro, the static block or the
+  constant at the click, or evaluates the file with `nim e`, and the
+  recording opens as a session in a tab of its own; the session you
+  traced from keeps its mode. The same operations are commands, at point:
+  `codetracer-trace-macro-at-point`,
+  `codetracer-trace-static-block-at-point`,
+  `codetracer-trace-constant-at-point` and `codetracer-trace-eval`. Each
+  reports point to CodeTracer before it runs, so it traces where you are.
+  The trace reads the **saved** file: save the buffer first, or unsaved
+  edits are not traced. It needs codetracer-nim -- its trace-enabled
+  nimsuggest named by `CODETRACER_NIMSUGGEST` and its `nim` on `PATH`, in
+  the environment the pane server starts in (`codetracer-server-environment`
+  can set both) -- as CodeTracer's terminal does; without them the command
+  says in the echo area what is missing.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 
@@ -131,8 +149,9 @@ or named by `codetracer-server-program`.
 repository's hooks; then `just build`, `just test`, `just lint`.
 `just test-server` runs the scenarios against a real pane server and
 recording, and `just test-edit` records a test of a Noir crate from the
-Test Results pane with the real `ct` and `nargo`; the Justfile names the
-environment they need.
+Test Results pane with the real `ct` and `nargo`, and `just test-nim`
+traces a Nim static block from the context menu with codetracer-nim; the
+Justfile names the environment they need.
 
 Status: under development.
 

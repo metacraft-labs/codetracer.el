@@ -1573,14 +1573,15 @@ fringe click: the window, the `left-fringe' area, the line's start."
     (list (event-convert-list (append modifiers '(mouse-1)))
           (list window 'left-fringe '(0 . 0) 0 nil pos '(0 . 0) nil '(0 . 0) '(0 . 0)))))
 
-(defun codetracer-test--wait-new-session (known what)
-  "Wait for a session whose id is not in KNOWN; return it.  WHAT names it."
+(defun codetracer-test--wait-new-session (known what &optional seconds)
+  "Wait for a session whose id is not in KNOWN; return it.  WHAT names it.
+It waits up to SECONDS, 240 by default."
   (let (found)
     (codetracer-test--wait-for
      (lambda ()
        (setq found (cl-loop for s being the hash-values of codetracer--sessions
                             unless (memq (codetracer-session-id s) known) return s)))
-     240 what)
+     (or seconds 240) what)
     found))
 
 (defun codetracer-test--session-ids ()
@@ -1776,6 +1777,167 @@ the variables every scenario needs."
                            (cl-incf images)))
                        (should (= images 1)))))))))
        (delete-directory gfx-trace t)))))
+
+;;;; Nim compile-time tracing (tag `nim')
+
+;; Editor-Hosted-Front-Ends §E12: with a Nim project in Edit mode, the
+;; context menu's CodeTracer submenu traces the static block at the click,
+;; and what the trace records opens as a session of its own, in a tab of
+;; its own.  Nothing is mocked: the pane server ($CODETRACER_TUI) over the
+;; calc recording ($CODETRACER_TEST_TRACE), started in the project's
+;; directory, which is its Edit-mode project; the project is PLAT-65's
+;; `tracing.nim', byte for byte (CodeTracer's `plat65_nim_project.nim',
+;; `TracingNim'); the trace is codetracer-nim's trace-enabled nimsuggest
+;; ($CODETRACER_NIMSUGGEST) and compiler (`nim' on PATH).  Batch Emacs
+;; cannot right-click: the click is the event a mouse-3 press delivers,
+;; constructed at a buffer position, and the menu is the one
+;; `context-menu-mode' builds from it (`context-menu-map').
+
+(defconst codetracer-test--tracing-nim
+  "import std/macros
+
+macro twice(body: untyped): untyped =
+  result = newStmtList(body, body)
+
+proc compute(n: int): int =
+  result = 0
+  for i in 1..n:
+    result += i * i
+
+const squares = compute(3)
+
+const
+  limit = 4
+  cubes = compute(limit)
+
+static:
+  var acc = 0
+  for i in 0..<limit:
+    acc += i
+  echo \"acc=\", acc
+
+echo \"after\"
+let folded = static(compute(5))
+
+twice:
+  echo squares
+"
+  "PLAT-65's tracing.nim: a macro, constants, a static block.")
+
+(defconst codetracer-test--static-line 18
+  "A line inside tracing.nim's `static:' block.")
+
+(ert-deftest codetracer-test-nim-buffers ()
+  "A Nim buffer is a .nim or .nims file, or one in `nim-mode'."
+  :tags '(unit)
+  (dolist (case '(("a.nim" . t) ("build.nims" . t) ("a.nimble" . nil)
+                  ("a.nim.txt" . nil) (nil . nil)))
+    (with-temp-buffer
+      (setq buffer-file-name (car case))
+      (should (eq (and (codetracer--nim-buffer-p) t) (cdr case)))
+      (setq buffer-file-name nil)))
+  ;; A buffer, not visiting a file, in a mode derived from nim-mode (the
+  ;; package is not loaded: the mode's parentage is what is tested).
+  (put 'codetracer-test--nim-mode 'derived-mode-parent 'nim-mode)
+  (with-temp-buffer
+    (setq major-mode 'codetracer-test--nim-mode)
+    (should (codetracer--nim-buffer-p)))
+  (with-temp-buffer
+    (setq major-mode 'text-mode)
+    (should-not (codetracer--nim-buffer-p))))
+
+(defun codetracer-test--check-nim-tracer ()
+  "Fail unless codetracer-nim's nimsuggest and compiler are there."
+  (let ((nimsuggest (getenv "CODETRACER_NIMSUGGEST")))
+    (unless (and nimsuggest (file-executable-p nimsuggest))
+      (ert-fail "CODETRACER_NIMSUGGEST is not codetracer-nim's nimsuggest: the Nim suite traces with it"))
+    (unless (executable-find "nim")
+      (ert-fail "nim is not on PATH: the Nim suite traces with codetracer-nim's compiler"))))
+
+(defun codetracer-test--right-click (window pos)
+  "The mouse-3 press event a right click in WINDOW at buffer position POS gives."
+  (list 'down-mouse-3
+        (list window pos '(0 . 0) 0 nil pos '(0 . 0) nil '(0 . 0) '(0 . 0))))
+
+(defun codetracer-test--menu-binding (map key)
+  "The command or keymap MAP binds KEY (a symbol) to, a menu item's included."
+  (let ((binding (lookup-key map (vector key))))
+    (if (eq (car-safe binding) 'menu-item) (nth 2 binding) binding)))
+
+(defun codetracer-test--line-pos (buffer line column)
+  "BUFFER's position at 1-based LINE and 0-based COLUMN."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line (1- line))
+      (move-to-column column)
+      (point))))
+
+(ert-deftest codetracer-test-nim-static-block-traced-from-the-context-menu ()
+  "The context menu traces a Nim static block; its recording opens in a tab.
+The menu is offered in a Nim buffer only; the session it was traced from
+stays in Edit mode."
+  :tags '(nim)
+  (codetracer-test--check-nim-tracer)
+  (let ((project (file-name-as-directory (make-temp-file "codetracer-el-nim" t))))
+    (with-temp-file (expand-file-name "tracing.nim" project)
+      (set-buffer-file-coding-system 'utf-8-unix)
+      (insert codetracer-test--tracing-nim))
+    (unwind-protect
+        (codetracer-test--with-server
+          (let* ((session (let ((default-directory project)) (codetracer-open trace)))
+                 (id (codetracer-session-id session)))
+            (codetracer-test--settle)
+            (codetracer--run "session.toggle-product-mode" :session id)
+            (codetracer-test--wait-for
+             (lambda () (equal (codetracer-session-mode session) "edit")) 30 "Edit mode")
+            (should (memq #'codetracer-context-menu (default-value 'context-menu-functions)))
+            (select-window (codetracer--source-window session))
+            (let* ((buffer (find-file (expand-file-name "tracing.nim" project)))
+                   (window (get-buffer-window buffer))
+                   (click (codetracer-test--right-click
+                           window (codetracer-test--line-pos
+                                   buffer codetracer-test--static-line 4)))
+                   (menu (context-menu-map click))
+                   (submenu (codetracer-test--menu-binding menu 'codetracer))
+                   (known (codetracer-test--session-ids))
+                   (tabs (length (tab-bar-tabs))))
+              (should (keymapp submenu))
+              (should (equal (cl-loop for (_label . command) in codetracer--nim-trace-items
+                                      when (codetracer-test--menu-binding submenu command)
+                                      collect command)
+                             (mapcar #'cdr codetracer--nim-trace-items)))
+              ;; Point is elsewhere: the item acts at the click.
+              (with-current-buffer buffer (goto-char (point-min)))
+              (set-window-point window (with-current-buffer buffer (point-min)))
+              (funcall (codetracer-test--menu-binding
+                        submenu 'codetracer-trace-static-block-at-point))
+              (should (eq (selected-window) window))
+              (should (= (line-number-at-pos (window-point window)) codetracer-test--static-line))
+              (should (equal codetracer--cursor-sent
+                             (list (expand-file-name "tracing.nim" project)
+                                   codetracer-test--static-line 5)))
+              (let ((opened (codetracer-test--wait-new-session known "the trace's recording" 300)))
+                (should (file-directory-p (codetracer-session-trace opened)))
+                (should (= (length (tab-bar-tabs)) (1+ tabs)))
+                (should (eq (codetracer--current-tab-session) opened))
+                (should-not (equal (codetracer-session-tab opened) (codetracer-session-tab session)))
+                ;; The session it was traced from is still in Edit mode.
+                (should (cl-find-if (lambda (s) (and (eql (plist-get s :session) id)
+                                                     (equal (plist-get s :mode) "edit")))
+                                    (codetracer--request :session/list))))
+              ;; Outside a Nim buffer the menu offers nothing of CodeTracer's.
+              (let ((other (find-file (expand-file-name "notes.txt" project))))
+                (should-not (codetracer-test--menu-binding
+                             (context-menu-map
+                              (codetracer-test--right-click (get-buffer-window other) 1))
+                             'codetracer))
+                (set-buffer-modified-p nil)))))
+      (dolist (b (buffer-list))
+        (when (and (buffer-file-name b) (string-prefix-p project (buffer-file-name b)))
+          (with-current-buffer b (set-buffer-modified-p nil))
+          (kill-buffer b)))
+      (delete-directory project t))))
 
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

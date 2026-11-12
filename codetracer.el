@@ -61,7 +61,11 @@
 ;; the source, where its fringe mark records it (`codetracer-test-at-point'
 ;; is the keyboard's way).  Edit mode works on the directory the
 ;; pane server was started in: the `default-directory' of the buffer the
-;; first session was opened from.
+;; first session was opened from.  In a Nim buffer, the context menu
+;; (`context-menu-mode') and `codetracer-trace-static-block-at-point' and
+;; its siblings trace what the compiler runs at point -- a macro, a static
+;; block, a constant, a `nim e' evaluation -- over the saved file, and the
+;; recording opens in a tab of its own.
 
 ;;; Code:
 
@@ -2334,18 +2338,26 @@ It lists the sources on this disk; `codetracer-sources' offers them all."
 (defvar codetracer--cursor-sent nil
   "The (FILE LINE COLUMN) last reported with `source/cursor'.")
 
+(defun codetracer--send-cursor (session file &optional force)
+  "Report point, in FILE, as SESSION's cursor (`source/cursor').
+The line and the column are 1-based.  A cursor already reported is not
+sent again, unless FORCE: an operation about to act at the cursor sends
+it whatever was sent before, since another session's report may have
+come between."
+  (let ((at (list file (line-number-at-pos) (1+ (current-column)))))
+    (when (or force (not (equal at codetracer--cursor-sent)))
+      (setq codetracer--cursor-sent at)
+      (codetracer--notify :source/cursor
+                          `(:session ,(codetracer-session-id session)
+                            :file ,(nth 0 at) :line ,(nth 1 at) :column ,(nth 2 at))))))
+
 (defun codetracer--report-cursor ()
   "Report the cursor of the selected window when it is in a recorded source."
   (when-let* (((codetracer--live-p))
               (session (codetracer--current-tab-session))
               (file (or codetracer--recorded-path buffer-file-name))
               ((member file (codetracer--source-paths session))))
-    (let ((at (list file (line-number-at-pos) (1+ (current-column)))))
-      (unless (equal at codetracer--cursor-sent)
-        (setq codetracer--cursor-sent at)
-        (codetracer--notify :source/cursor
-                            `(:session ,(codetracer-session-id session)
-                              :file ,(nth 0 at) :line ,(nth 1 at) :column ,(nth 2 at)))))))
+    (codetracer--send-cursor session file)))
 
 (defun codetracer--watch-sources (session)
   "Report files created, renamed and deleted beside SESSION's sources.
@@ -2507,6 +2519,105 @@ Emacs's own lock, backup and auto-save files are not the user's files."
       (codetracer--show-position session pos))
     session))
 
+;;;; Nim compile-time tracing
+
+;; In a Nim project, CodeTracer traces what the compiler runs: a macro's
+;; expansion, a `static:' block, a constant's evaluation, a NimScript run
+;; (`nim e').  The trace runs codetracer-nim's trace-enabled nimsuggest (or
+;; `nim e --trace') over the saved file at the session's cursor, and its
+;; recording opens as a session of its own (`session/opened'), in a new tab;
+;; the session it was started from keeps its mode.  The commands below
+;; report point first, since the server acts at the cursor it was last told
+;; of, and `codetracer-context-menu' offers them on a right click in a Nim
+;; buffer (`context-menu-mode').
+
+(defconst codetracer--nim-trace-items
+  '(("Trace macro" . codetracer-trace-macro-at-point)
+    ("Trace static block" . codetracer-trace-static-block-at-point)
+    ("Trace constant" . codetracer-trace-constant-at-point)
+    ("Evaluate with nim e" . codetracer-trace-eval))
+  "The CodeTracer submenu of a Nim buffer's context menu: label, command.")
+
+(defun codetracer--nim-buffer-p (&optional buffer)
+  "Non-nil when BUFFER (the current one when nil) is Nim source.
+That is a `.nim' or `.nims' file, or a buffer in `nim-mode' or a mode
+derived from it (`nimscript-mode' among them)."
+  (with-current-buffer (or buffer (current-buffer))
+    (or (derived-mode-p 'nim-mode 'nimscript-mode)
+        (let ((file (or codetracer--recorded-path buffer-file-name)))
+          (and (stringp file) (string-match-p "\\.nims?\\'" file))))))
+
+(defun codetracer--nim-session ()
+  "The session a Nim trace is run for: the current tab's, or the active one."
+  (or (codetracer--current-tab-session)
+      (and codetracer--active-session (codetracer--session codetracer--active-session))))
+
+(defun codetracer--trace-at-point (operation)
+  "Run the Nim trace OPERATION at point, in the selected window.
+Point is reported as the session's cursor first (`source/cursor').  A
+refusal -- no Nim tracer, nothing to trace at the cursor -- is shown in
+the echo area; the recording opens in a tab of its own when it is made."
+  (unless (codetracer--live-p)
+    (user-error "CodeTracer is not running; start it with `codetracer-open'"))
+  (let ((session (or (codetracer--nim-session)
+                     (user-error "No CodeTracer session is open")))
+        (file (or codetracer--recorded-path buffer-file-name
+                  (user-error "This buffer shows no file"))))
+    (codetracer--send-cursor session file t)
+    (codetracer--run operation :session (codetracer-session-id session))))
+
+(defun codetracer-trace-macro-at-point ()
+  "Trace the expansion of the Nim macro at point; its recording opens.
+The trace reads the saved file."
+  (interactive)
+  (codetracer--trace-at-point "editor.trace-macro-at-cursor"))
+
+(defun codetracer-trace-static-block-at-point ()
+  "Trace the Nim `static:' block point is in; its recording opens.
+The trace reads the saved file."
+  (interactive)
+  (codetracer--trace-at-point "editor.trace-static-block-at-cursor"))
+
+(defun codetracer-trace-constant-at-point ()
+  "Trace the evaluation of the Nim constant at point; its recording opens.
+The trace reads the saved file."
+  (interactive)
+  (codetracer--trace-at-point "editor.trace-constant-at-cursor"))
+
+(defun codetracer-trace-eval ()
+  "Evaluate this NimScript with `nim e', traced; its recording opens.
+The trace reads the saved file."
+  (interactive)
+  (codetracer--trace-at-point "editor.trace-eval"))
+
+(defun codetracer--at-click (click command)
+  "A command running COMMAND with point where CLICK was."
+  (lambda ()
+    (interactive)
+    (let ((posn (event-start click)))
+      (when (and (windowp (posn-window posn)) (integer-or-marker-p (posn-point posn)))
+        (posn-set-point posn)))
+    (call-interactively command)))
+
+(defun codetracer-context-menu (menu click)
+  "Add CodeTracer's Nim tracing to MENU, the context menu CLICK opened.
+In a Nim buffer while a CodeTracer session is open, a \"CodeTracer\"
+submenu traces the macro, the static block or the constant at the click,
+or evaluates the file with `nim e'; the click's position becomes point
+before the item runs.  Anywhere else MENU is left as it is.  This is an
+entry of `context-menu-functions', added while the pane server runs."
+  (let* ((window (posn-window (event-start click)))
+         (buffer (if (windowp window) (window-buffer window) (current-buffer))))
+    (when (and (codetracer--live-p) (codetracer--nim-session)
+               (codetracer--nim-buffer-p buffer))
+      (let ((submenu (make-sparse-keymap "CodeTracer")))
+        (dolist (item (reverse codetracer--nim-trace-items))
+          (define-key submenu (vector (cdr item))
+                      `(menu-item ,(car item) ,(codetracer--at-click click (cdr item)))))
+        (define-key-after menu [codetracer-separator] menu-bar-separator)
+        (define-key-after menu [codetracer] `(menu-item "CodeTracer" ,submenu)))))
+  menu)
+
 ;;;; Hooks
 
 (defun codetracer--install-hooks ()
@@ -2517,7 +2628,8 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (add-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
   (add-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
   (add-hook 'post-command-hook #'codetracer--report-cursor)
-  (add-hook 'find-file-hook #'codetracer--render-current-tests))
+  (add-hook 'find-file-hook #'codetracer--render-current-tests)
+  (add-hook 'context-menu-functions #'codetracer-context-menu))
 
 (defun codetracer--remove-hooks ()
   "Stop watching windows and tabs."
@@ -2527,7 +2639,8 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (remove-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
   (remove-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
   (remove-hook 'post-command-hook #'codetracer--report-cursor)
-  (remove-hook 'find-file-hook #'codetracer--render-current-tests))
+  (remove-hook 'find-file-hook #'codetracer--render-current-tests)
+  (remove-hook 'context-menu-functions #'codetracer-context-menu))
 
 ;;;; Commands most people bind
 

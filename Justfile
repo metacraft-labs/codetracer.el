@@ -30,6 +30,13 @@
 # recorder:
 #   CT_BIN                 the `ct` binary, when it is not on PATH
 #   nargo                  on PATH (the crate is a Noir one)
+#
+# `test-nim` traces the static block of PLAT-65's tracing.nim from the
+# context menu of a Nim buffer, and checks the recording opens in a tab of
+# its own. Besides CODETRACER_TUI and CODETRACER_TEST_TRACE it needs
+# codetracer-nim (CodeTracer's dev shell provides both):
+#   CODETRACER_NIMSUGGEST  its trace-enabled nimsuggest
+#   nim                    its compiler, on PATH
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -56,6 +63,10 @@ test-server:
 # of its own (see above).
 test-edit:
     {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag edit)))'
+
+# Nim compile-time tracing from the context menu (see above).
+test-nim:
+    {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag nim)))'
 
 lint: lint-elisp lint-nix
 
