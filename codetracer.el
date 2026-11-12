@@ -57,7 +57,9 @@
 ;; function keys of your CodeTracer keymap are bound in the session's source
 ;; buffer (`codetracer-source-mode'), your own bindings first.  A recording
 ;; CodeTracer makes itself, such as a test recorded from the Test Results
-;; pane, opens in a tab of its own.  Edit mode works on the directory the
+;; pane, opens in a tab of its own; so does a test recorded from its line in
+;; the source, where its fringe mark records it (`codetracer-test-at-point'
+;; is the keyboard's way).  Edit mode works on the directory the
 ;; pane server was started in: the `default-directory' of the buffer the
 ;; first session was opened from.
 
@@ -149,6 +151,18 @@ default function-key commands (F10's `menu-bar-open', F11's
 `toggle-frame-fullscreen', ...) give way."
   :type 'boolean)
 
+(defcustom codetracer-tests-placement 'gutter
+  "Where a test's control is drawn in the source.
+The tests are the ones CodeTracer's Test Results pane lists for the
+file.  `gutter' puts a mark in the left fringe of the test's line: a
+play mark, or the test's last verdict; click it to record the test
+\(Ctrl+click: in place of the current session).  `above-line' puts a
+line reading \"▶ Record NAME\" above the test instead, a button that
+records it; `both' draws both."
+  :type '(choice (const :tag "A fringe mark on the test's line" gutter)
+                 (const :tag "A button line above the test" above-line)
+                 (const :tag "Both" both)))
+
 ;;;; Faces
 
 (defface codetracer-chrome '((t :inherit default))
@@ -197,6 +211,12 @@ default function-key commands (F10's `menu-bar-open', F11's
   "The fringe mark of a tracepoint.")
 (defface codetracer-execution-fringe '((t :inherit success))
   "The fringe arrow on the execution line.")
+(defface codetracer-test-fringe '((t :inherit font-lock-function-name-face))
+  "The fringe mark of a test not yet run, and the above-line button.")
+(defface codetracer-test-passed-fringe '((t :inherit success))
+  "The fringe mark of a test whose last run passed.")
+(defface codetracer-test-failed-fringe '((t :inherit error))
+  "The fringe mark of a test whose last run failed.")
 (defface codetracer-stack-tab '((t :inherit shadow))
   "The name of a stacked pane its window does not show, in the window's tabs.")
 (defface codetracer-stack-tab-active '((t :inherit (highlight bold)))
@@ -290,7 +310,10 @@ else unstyled."
   ;; The debugger controls (`controls/state' buttons, as plists) and the
   ;; source buffer's keys, (EMACS-KEY . OPERATION) from the `editor' pane's
   ;; keymap.
-  controls source-bindings)
+  controls source-bindings
+  ;; The `source/tests' controls, as lists of plists, by the file's
+  ;; `codetracer--test-file-key'.
+  (tests (make-hash-table :test #'equal)))
 
 (defvar codetracer--connection nil
   "The `jsonrpc-process-connection' to the pane server, or nil.")
@@ -463,13 +486,14 @@ be a local process's: the home directory is used then."
         codetracer--active-session nil)
   (clrhash codetracer--sessions)
   (clrhash codetracer--early-notifications)
+  (codetracer--render-all-tests)
   (codetracer--sync-source-keys)
   (codetracer--sync-controls)
   (codetracer--remove-hooks))
 
 (defun codetracer--dispatch (_conn method params)
   "Handle the server's notification METHOD with PARAMS."
-  (if (and (memq method '(pane/keymap controls/state))
+  (if (and (memq method '(pane/keymap controls/state source/tests))
            (not (codetracer--session (plist-get params :session))))
       (push (cons method params)
             (gethash (plist-get params :session) codetracer--early-notifications))
@@ -482,6 +506,7 @@ be a local process's: the home directory is used then."
       ('source/show (codetracer--on-source-show params))
       ('session/opened (codetracer--on-session-opened params))
       ('controls/state (codetracer--on-controls-state params))
+      ('source/tests (codetracer--on-source-tests params))
       (_ nil))))
 
 ;;;; Sessions and tabs
@@ -622,6 +647,8 @@ The debugger keys follow the tab, whoever selected it."
   (unless codetracer--realizing
     (when-let ((session (codetracer--current-tab-session)))
       (codetracer--activate session)))
+  ;; A file two sessions hold tests for shows the current tab's.
+  (codetracer--render-all-tests)
   (codetracer--sync-source-keys))
 
 (defun codetracer-close-session (id)
@@ -645,6 +672,9 @@ as a notification handler must."
     (codetracer--clear-decorations session)
     (codetracer--unwatch-sources session)
     (remhash id codetracer--sessions)
+    ;; Its tests leave the source with it (another session's, if one holds
+    ;; the same file's, take their place).
+    (codetracer--render-all-tests)
     (when (equal codetracer--active-session id)
       (setq codetracer--active-session nil))
     (when-let ((index (tab-bar--tab-index-by-name (codetracer-session-tab session))))
@@ -1901,7 +1931,8 @@ window when it is not a side window, else any live window that is not."
           (puthash key (list ov) (codetracer-session-decorations session)))))))
 
 (defun codetracer--report-source-viewport (session window)
-  "Tell the server the lines visible in SESSION's source WINDOW."
+  "Tell the server the lines visible in SESSION's source WINDOW.
+The server answers with that file's decorations and its tests."
   (let ((file (with-current-buffer (window-buffer window)
                 (or codetracer--recorded-path buffer-file-name))))
     (when file
@@ -1977,6 +2008,226 @@ window when it is not a side window, else any live window that is not."
            (codetracer-session-decorations session))
   (clrhash (codetracer-session-decorations session)))
 
+;;;; Tests from the source
+
+;; A source file's tests -- the ones the session's Test Results pane lists,
+;; with their lines and last verdicts -- arrive as `source/tests' for the
+;; file the source window shows, and again when a test or its state
+;; changes.  They are drawn in every buffer visiting that file: a fringe
+;; mark on the test's line (`codetracer-tests-placement'), whose
+;; `[left-fringe mouse-1]' records the test, or a button line above it.  A
+;; press is the Test Results pane's own (`tests.open-test'), so the source
+;; and the pane cannot disagree about what a test is or what it did; the
+;; recording opens as a session of its own (`session/opened').
+;;
+;; The click binding lives in a `keymap' overlay property on the test's
+;; line only.  A mouse event is looked up in the keymaps at its position,
+;; so a fringe click on any other line, and every key and click in the
+;; text, stay what they were.
+
+(define-fringe-bitmap 'codetracer-test-play
+  [#b11000000 #b11110000 #b11111100 #b11111111
+              #b11111111 #b11111100 #b11110000 #b11000000]
+  nil nil 'center)
+
+(define-fringe-bitmap 'codetracer-test-passed
+  [#b00000000 #b00000011 #b00000110 #b11001100
+              #b01111000 #b00110000 #b00000000 #b00000000]
+  nil nil 'center)
+
+(define-fringe-bitmap 'codetracer-test-failed
+  [#b11000011 #b01100110 #b00111100 #b00011000
+              #b00111100 #b01100110 #b11000011 #b00000000]
+  nil nil 'center)
+
+(defvar codetracer-test-line-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [left-fringe mouse-1] #'codetracer-test-fringe-click)
+    (define-key map [left-fringe C-mouse-1] #'codetracer-test-fringe-click-here)
+    ;; The presses whose releases are the clicks above: without these,
+    ;; Emacs would read them as the text area's (C-down-mouse-1 pops up
+    ;; the buffer menu).
+    (define-key map [left-fringe down-mouse-1] #'ignore)
+    (define-key map [left-fringe C-down-mouse-1] #'ignore)
+    map)
+  "The fringe clicks on a test's line, from its overlay's `keymap'.")
+
+(defvar-local codetracer--test-overlays nil
+  "The overlays drawing this buffer's tests.")
+
+(defun codetracer--test-file-key (file)
+  "The key of FILE's test controls: its absolute name, links resolved."
+  (file-truename (expand-file-name file)))
+
+(defun codetracer--buffer-test-file (buffer)
+  "The key of the file in BUFFER (a visited file or a recorded source), or nil."
+  (with-current-buffer buffer
+    (let ((file (or codetracer--recorded-path buffer-file-name)))
+      (and file (codetracer--test-file-key file)))))
+
+(defun codetracer--tests-session (key)
+  "The session whose test controls for the file KEY are drawn.
+It is the current tab's when it holds that file's, else any that does."
+  (let ((current (codetracer--current-tab-session)))
+    (if (and current (gethash key (codetracer-session-tests current)))
+        current
+      (cl-loop for s being the hash-values of codetracer--sessions
+               when (gethash key (codetracer-session-tests s)) return s))))
+
+(defun codetracer--test-fringe (control)
+  "The fringe bitmap and face of the test CONTROL: its last verdict, or play."
+  (pcase (plist-get control :state)
+    ("passed" '(codetracer-test-passed . codetracer-test-passed-fringe))
+    ("failed" '(codetracer-test-failed . codetracer-test-failed-fringe))
+    (_ '(codetracer-test-play . codetracer-test-fringe))))
+
+(defun codetracer--test-button (session control)
+  "The above-line button recording SESSION's test CONTROL, newline included."
+  (let ((id (codetracer-session-id session))
+        (test (plist-get control :testId)))
+    (concat (make-text-button
+             (format "▶ Record %s" (plist-get control :name)) nil
+             'face 'codetracer-test-fringe
+             'follow-link t
+             'help-echo "Record this test"
+             'action (lambda (_button)
+                       (when-let* ((s (codetracer--session id)))
+                         (codetracer--record-test s (codetracer--test-control s test)))))
+            "\n")))
+
+(defun codetracer--render-tests (buffer)
+  "Draw in BUFFER the test controls of its file, from a session."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (mapc #'delete-overlay codetracer--test-overlays)
+      (setq codetracer--test-overlays nil)
+      (when-let* ((key (codetracer--buffer-test-file buffer))
+                  (session (codetracer--tests-session key)))
+        (let ((gutter (memq codetracer-tests-placement '(gutter both)))
+              (above (memq codetracer-tests-placement '(above-line both))))
+          (save-excursion
+            (save-restriction
+              (widen)
+              (dolist (control (gethash key (codetracer-session-tests session)))
+                (let ((line (plist-get control :line)))
+                  (goto-char (point-min))
+                  (when (and (integerp line) (> line 0) (zerop (forward-line (1- line))))
+                    (let ((ov (make-overlay (line-beginning-position)
+                                            (min (point-max) (1+ (line-end-position)))
+                                            nil t nil))
+                          (fringe (codetracer--test-fringe control)))
+                      (overlay-put ov 'codetracer-test control)
+                      (overlay-put ov 'codetracer-test-session (codetracer-session-id session))
+                      (overlay-put ov 'before-string
+                                   (concat (if above (codetracer--test-button session control) "")
+                                           (if gutter
+                                               (codetracer--fringe-string (car fringe) (cdr fringe))
+                                             "")))
+                      (when gutter
+                        (overlay-put ov 'keymap codetracer-test-line-map))
+                      (push ov codetracer--test-overlays))))))))))))
+
+(defun codetracer--render-file-tests (key)
+  "Draw the test controls in every buffer visiting the file KEY."
+  (dolist (buffer (buffer-list))
+    (when (equal (codetracer--buffer-test-file buffer) key)
+      (codetracer--render-tests buffer))))
+
+(defun codetracer--render-all-tests ()
+  "Draw the test controls in every buffer visiting a file.
+After a session closed or the tab changed, another session's may now be
+the ones drawn."
+  (dolist (buffer (buffer-list))
+    (when (or (buffer-local-value 'codetracer--test-overlays buffer)
+              (and (codetracer--buffer-test-file buffer)
+                   (codetracer--tests-session (codetracer--buffer-test-file buffer))))
+      (codetracer--render-tests buffer))))
+
+(defun codetracer--render-current-tests ()
+  "Draw the test controls of the current buffer, a file just visited."
+  (when (codetracer--live-p)
+    (codetracer--render-tests (current-buffer))))
+
+(defun codetracer--on-source-tests (params)
+  "Keep and draw the test controls of a file, from PARAMS.
+PARAMS are a `source/tests' notification's."
+  (when-let* ((session (codetracer--session (plist-get params :session)))
+              (file (plist-get params :file))
+              ((stringp file)))
+    (let ((key (codetracer--test-file-key file)))
+      (puthash key (append (plist-get params :controls) nil)
+               (codetracer-session-tests session))
+      (codetracer--render-file-tests key))))
+
+(defun codetracer--test-control (session test)
+  "SESSION's control of the test whose id is TEST, or nil."
+  (cl-loop for controls being the hash-values of (codetracer-session-tests session)
+           thereis (cl-find test controls
+                            :key (lambda (c) (plist-get c :testId)) :test #'equal)))
+
+(defun codetracer--record-test (session control &optional here)
+  "Record SESSION's test CONTROL and open its recording.
+The recording opens in a tab of its own; with HERE, in place of
+SESSION (the Test Results pane's Ctrl on the press).  A control that
+cannot act now shows why instead."
+  (let ((open (plist-get control :open)))
+    (cond ((null control)
+           (message "CodeTracer: that test is no longer listed"))
+          ((eq (plist-get open :enabled) :json-false)
+           (message "CodeTracer: %s" (or (plist-get open :title)
+                                         "this test cannot be recorded now")))
+          (t
+           (codetracer--run "tests.open-test"
+                            :session (codetracer-session-id session)
+                            :pane "testResults"
+                            :args `(:path ,(plist-get control :testId)
+                                          ,@(when here '(:text "redirect"))))))))
+
+(defun codetracer--test-at-event (event)
+  "The (SESSION . CONTROL) of the test on the line EVENT was on, or nil."
+  (let* ((posn (event-start event))
+         (window (posn-window posn))
+         (pos (posn-point posn)))
+    (when (and (windowp window) (integer-or-marker-p pos))
+      (with-current-buffer (window-buffer window)
+        (cl-loop for ov in (overlays-at pos)
+                 for control = (overlay-get ov 'codetracer-test)
+                 for session = (codetracer--session (overlay-get ov 'codetracer-test-session))
+                 when (and control session) return (cons session control))))))
+
+(defun codetracer-test-fringe-click (event &optional here)
+  "Record the test whose fringe mark EVENT clicked; its recording opens.
+With HERE, it opens in place of the session the test is from."
+  (interactive "e")
+  (if-let* ((hit (codetracer--test-at-event event)))
+      (codetracer--record-test (car hit) (cdr hit) here)
+    (message "CodeTracer: no test on this line")))
+
+(defun codetracer-test-fringe-click-here (event)
+  "Record the test whose fringe mark EVENT clicked, in place of its session."
+  (interactive "e")
+  (codetracer-test-fringe-click event t))
+
+(defun codetracer-test-at-point (&optional here)
+  "Record the test point is in, and open its recording in a tab of its own.
+The test is the last one CodeTracer lists in this file whose line is at
+or above point.  With a prefix argument HERE, the recording takes the
+place of the current session instead."
+  (interactive "P")
+  (let* ((key (or (codetracer--buffer-test-file (current-buffer))
+                  (user-error "This buffer shows no file")))
+         (session (codetracer--tests-session key))
+         (line (line-number-at-pos))
+         (best nil))
+    (dolist (control (and session (gethash key (codetracer-session-tests session))))
+      (let ((at (plist-get control :line)))
+        (when (and (integerp at) (<= at line)
+                   (or (null best) (> at (plist-get best :line))))
+          (setq best control))))
+    (unless best
+      (user-error "No test of CodeTracer's at point"))
+    (codetracer--record-test session best here)))
+
 ;;;; Panel roles
 
 ;; The source editor is always Emacs's own buffers (E7): the source window
@@ -2009,6 +2260,7 @@ notification, where a request must not wait)."
           (setq-local codetracer--recorded-path path)
           (setq-local codetracer--pane-session (codetracer-session-id session))
           (read-only-mode 1)
+          (codetracer--render-tests (current-buffer))
           (let ((target (current-buffer)))
             (codetracer--send :source/read
                               `(:session ,(codetracer-session-id session) :file ,path)
@@ -2264,7 +2516,8 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (add-hook 'window-scroll-functions #'codetracer--on-window-scroll)
   (add-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
   (add-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
-  (add-hook 'post-command-hook #'codetracer--report-cursor))
+  (add-hook 'post-command-hook #'codetracer--report-cursor)
+  (add-hook 'find-file-hook #'codetracer--render-current-tests))
 
 (defun codetracer--remove-hooks ()
   "Stop watching windows and tabs."
@@ -2273,7 +2526,8 @@ Emacs's own lock, backup and auto-save files are not the user's files."
   (remove-hook 'window-scroll-functions #'codetracer--on-window-scroll)
   (remove-hook 'tab-bar-tab-post-select-functions #'codetracer--on-tab-selected)
   (remove-hook 'tab-bar-tab-post-open-functions #'codetracer--on-tab-selected)
-  (remove-hook 'post-command-hook #'codetracer--report-cursor))
+  (remove-hook 'post-command-hook #'codetracer--report-cursor)
+  (remove-hook 'find-file-hook #'codetracer--render-current-tests))
 
 ;;;; Commands most people bind
 

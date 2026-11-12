@@ -22,8 +22,10 @@
 # Without them it fails, by design: a suite that skipped would pass with no
 # server at all.
 #
-# `test-edit` records a test of a two-test Noir crate from the Test Results
-# pane and checks its recording opens in a tab of its own. Besides the
+# `test-edit` records the tests of a two-test Noir crate from the Test
+# Results pane and from their lines in the source (the fringe marks and
+# `codetracer-test-at-point`), and checks each recording opens in a tab of
+# its own, or in place of the session it was made from. Besides the
 # variables above (CODETRACER_TUI, CODETRACER_TEST_TRACE) it needs the real
 # recorder:
 #   CT_BIN                 the `ct` binary, when it is not on PATH

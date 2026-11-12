@@ -109,6 +109,19 @@ or named by `codetracer-server-program`.
   in a new tab, and the echo area says so. With the "current tab"
   placement it takes the place of the session it was made from, whose tab
   closes.
+- A source file's tests -- the ones the Test Results pane lists -- are
+  marked in the left fringe of their lines: a play mark, or the last
+  verdict (passed, failed). Click a mark to record that test; its
+  recording opens in a tab of its own. Ctrl+click records it in place of
+  the current session instead. Clicks anywhere else, and in the text, are
+  left alone. `codetracer-test-at-point` records the test point is in (the
+  last one at or above it); with a prefix argument (`C-u`) the recording
+  takes the current session's place. It has no default key: bind it. A
+  test that cannot be recorded now (a build is running, say) says why in
+  the echo area. Set `codetracer-tests-placement` to `above-line` for a
+  `▶ Record <test>` button above each test instead of the fringe mark, or
+  to `both`. The marks' faces are `codetracer-test-fringe`,
+  `codetracer-test-passed-fringe` and `codetracer-test-failed-fringe`.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 

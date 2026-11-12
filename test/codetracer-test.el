@@ -440,6 +440,89 @@ format of the user's own is left alone."
                      '(("<f10>" . "debugger.step-over"))))
       (should-not (gethash 4 codetracer--early-notifications)))))
 
+(defmacro codetracer-test--with-test-controls (controls &rest body)
+  "Run BODY in a buffer visiting the crate's main.nr, CONTROLS its tests.
+CONTROLS are `source/tests' controls of session 7, registered alone."
+  (declare (indent 1))
+  `(let* ((codetracer--sessions (make-hash-table))
+          (file (make-temp-file "codetracer-el-main" nil ".nr" codetracer-test--main-nr))
+          (session (codetracer--make-session :id 7 :title "calc")))
+     (puthash 7 session codetracer--sessions)
+     (unwind-protect
+         (with-current-buffer (find-file-noselect file)
+           (codetracer--on-source-tests `(:session 7 :file ,file :controls ,(vconcat ,controls)))
+           ,@body)
+       (when-let* ((b (find-buffer-visiting file))) (kill-buffer b))
+       (delete-file file))))
+
+(defun codetracer-test--before-strings ()
+  "The current buffer's test overlays' `before-string's, by line."
+  (mapcar (lambda (m) (cons (car m) (overlay-get (cddr m) 'before-string)))
+          (codetracer-test--test-overlays (current-buffer))))
+
+(ert-deftest codetracer-test-test-controls-drawn-by-placement ()
+  "A test's control is a fringe mark showing its verdict, a button line, or both."
+  :tags '(unit)
+  (let ((controls '((:line 5 :testId "t1" :name "test_passes" :state "passed"
+                           :open (:enabled t))
+                    (:line 10 :testId "t2" :name "test_fails" :state "failed"
+                           :open (:enabled :json-false :title "a build is running")))))
+    (let ((codetracer-tests-placement 'gutter))
+      (codetracer-test--with-test-controls controls
+        (let ((marks (codetracer-test--test-overlays (current-buffer))))
+          (should (equal (mapcar #'car marks) '(5 10)))
+          (should (equal (mapcar #'cadr marks)
+                         '(codetracer-test-passed codetracer-test-failed)))
+          (should (eq (overlay-get (cddr (car marks)) 'keymap) codetracer-test-line-map)))
+        (should-not (cl-some (lambda (b) (string-search "Record" (cdr b)))
+                             (codetracer-test--before-strings)))))
+    (let ((codetracer-tests-placement 'above-line))
+      (codetracer-test--with-test-controls controls
+        (let* ((strings (codetracer-test--before-strings))
+               (button (cdr (car strings))))
+          (should (equal (mapcar #'car strings) '(5 10)))
+          (should (string-prefix-p "▶ Record test_passes\n" button))
+          ;; No fringe mark, and no fringe click to take.
+          (should-not (cl-find-if (lambda (m) (cadr m))
+                                  (codetracer-test--test-overlays (current-buffer))))
+          (should-not (overlay-get (cddr (car (codetracer-test--test-overlays (current-buffer))))
+                                   'keymap))
+          ;; A button: mouse-1 follows it, RET and mouse-2 press it.
+          (should (get-text-property 0 'button button))
+          (should (eq (get-text-property 0 'follow-link button) t))
+          ;; The disabled test's button says why instead of recording.
+          (let ((disabled (cdr (nth 1 strings))))
+            (should (equal (funcall (get-text-property 0 'action disabled) nil)
+                           "CodeTracer: a build is running"))))))
+    (let ((codetracer-tests-placement 'both))
+      (codetracer-test--with-test-controls controls
+        (should (equal (mapcar #'cadr (codetracer-test--test-overlays (current-buffer)))
+                       '(codetracer-test-passed codetracer-test-failed)))
+        (should (string-prefix-p "▶ Record test_fails\n"
+                                 (cdr (nth 1 (codetracer-test--before-strings)))))))
+    ;; A later `source/tests' replaces the drawing; one with none clears it.
+    (codetracer-test--with-test-controls controls
+      (codetracer--on-source-tests `(:session 7 :file ,buffer-file-name
+                                              :controls [(:line 10 :testId "t2" :name "test_fails"
+                                                                :state "" :open (:enabled t))]))
+      (should (equal (mapcar (lambda (m) (list (car m) (cadr m)))
+                             (codetracer-test--test-overlays (current-buffer)))
+                     '((10 codetracer-test-play))))
+      (codetracer--on-source-tests `(:session 7 :file ,buffer-file-name :controls []))
+      (should-not codetracer--test-overlays))))
+
+(ert-deftest codetracer-test-test-at-point-refusals ()
+  "Above every test there is none; a disabled test's control says why."
+  :tags '(unit)
+  (codetracer-test--with-test-controls
+      '((:line 5 :testId "t1" :name "test_passes" :state "" :open (:enabled t))
+        (:line 10 :testId "t2" :name "test_fails" :state ""
+               :open (:enabled :json-false :title "the test is being recorded")))
+    (goto-char (point-min))
+    (should-error (codetracer-test-at-point) :type 'user-error)
+    (forward-line 10)                   ; line 11, inside test_fails
+    (should (equal (codetracer-test-at-point) "CodeTracer: the test is being recorded"))))
+
 (ert-deftest codetracer-test-server-directory ()
   "The pane server starts in the current buffer's directory, the Edit-mode project."
   :tags '(unit)
@@ -1370,23 +1453,41 @@ fn test_fails() {
                                   for spot = (codetracer--hotspot-at pos)
                                   when (equal (car spot) operation) return spot))))))
 
-(ert-deftest codetracer-test-recorded-test-opens-a-session-tab ()
-  "A test recorded from Test Results opens its recording in a tab of its own."
-  :tags '(edit)
+(defun codetracer-test--check-recorder ()
+  "Fail unless the real recorder the edit-mode cases use is there."
   (let ((ct (or (getenv "CT_BIN") (executable-find "ct"))))
     (unless (and ct (file-executable-p ct))
       (ert-fail "ct is not found (CT_BIN or PATH): the edit-mode suite records with it"))
     (unless (executable-find "nargo")
-      (ert-fail "nargo is not on PATH: the edit-mode suite's crate is a Noir one")))
-  (let* ((crate (codetracer-test--write-crate))
-         (certificates (make-temp-file "codetracer-el-certificates" t))
-         (process-environment (cons (concat "TEST_CERTIFICATES_DIR=" certificates)
-                                    process-environment)))
-    (unwind-protect
-        (codetracer-test--with-server
-          (let* ((session (let ((default-directory crate)) (codetracer-open trace)))
-                 (_ (codetracer-test--settle))
-                 (window (codetracer-test--show-stacked-pane session "testResults"))
+      (ert-fail "nargo is not on PATH: the edit-mode suite's crate is a Noir one"))))
+
+(defmacro codetracer-test--with-crate-session (&rest body)
+  "Run BODY with `crate' and `session': the calc recording, its server in the crate.
+The crate is the two-test Noir one, written to a temporary directory the
+pane server is started in, so it is the session's Edit-mode project."
+  (declare (indent 0))
+  `(progn
+     (codetracer-test--check-recorder)
+     (let* ((crate (codetracer-test--write-crate))
+            (certificates (make-temp-file "codetracer-el-certificates" t))
+            (process-environment (cons (concat "TEST_CERTIFICATES_DIR=" certificates)
+                                       process-environment)))
+       (unwind-protect
+           (codetracer-test--with-server
+             (let ((session (let ((default-directory crate)) (codetracer-open trace))))
+               (codetracer-test--settle)
+               ,@body))
+         (dolist (b (buffer-list))
+           (when (and (buffer-file-name b) (string-prefix-p crate (buffer-file-name b)))
+             (kill-buffer b)))
+         (delete-directory crate t)
+         (delete-directory certificates t)))))
+
+(ert-deftest codetracer-test-recorded-test-opens-a-session-tab ()
+  "A test recorded from Test Results opens its recording in a tab of its own."
+  :tags '(edit)
+  (codetracer-test--with-crate-session
+          (let* ((window (codetracer-test--show-stacked-pane session "testResults"))
                  (buffer (gethash "testResults" (codetracer-session-panes session)))
                  (spot nil))
             (should window)
@@ -1422,9 +1523,180 @@ fn test_fails() {
                 (should (cl-find-if (lambda (w) (eql (buffer-local-value 'codetracer--pane-session
                                                                          (window-buffer w))
                                                      (codetracer-session-id opened)))
-                                    (codetracer--pane-windows)))))))
-      (delete-directory crate t)
-      (delete-directory certificates t))))
+                                    (codetracer--pane-windows))))))))
+
+;;;;; Tests from the source
+
+;; The crate's tests, as the source shows them (`source/tests'): a fringe
+;; mark on each test's line whose `[left-fringe mouse-1]' records it, and
+;; `codetracer-test-at-point'.  Batch Emacs cannot click, and runs no
+;; redisplay: the click is the event a fringe click delivers, constructed
+;; (a `left-fringe' position on the line), its command found the way the
+;; command loop finds it -- `key-binding' in the keymaps at the event's
+;; position -- and called with that event.  The file is shown with
+;; `find-file', whose `set-window-buffer' runs `window-scroll-functions'
+;; even in batch: that is what reports the source window's file to the
+;; server (`source/viewport'), which then sends its tests.
+
+(defun codetracer-test--test-overlays (buffer)
+  "BUFFER's test overlays, as (LINE BITMAP . OVERLAY), sorted by line.
+BITMAP is the left-fringe bitmap the overlay draws, or nil."
+  (with-current-buffer buffer
+    (sort (mapcar (lambda (ov)
+                    (let* ((string (overlay-get ov 'before-string))
+                           (display (cl-loop for i below (length string)
+                                             for d = (get-text-property i 'display string)
+                                             when (eq (car-safe d) 'left-fringe) return d)))
+                      (cons (line-number-at-pos (overlay-start ov))
+                            (cons (nth 1 display) ov))))
+                  codetracer--test-overlays)
+          (lambda (a b) (< (car a) (car b))))))
+
+(defun codetracer-test--visit-main (session crate)
+  "Show the crate's src/main.nr in SESSION's source window; return its buffer.
+It waits for the file's two tests to be drawn."
+  (select-window (codetracer--source-window session))
+  (let ((buffer (find-file (expand-file-name "src/main.nr" crate))))
+    (codetracer-test--wait-for
+     (lambda () (= (length (codetracer-test--test-overlays buffer)) 2))
+     60 "the crate's two tests drawn in src/main.nr")
+    buffer))
+
+(defun codetracer-test--fringe-event (window line &optional modifiers)
+  "A mouse-1 click event in WINDOW's left fringe on LINE, with MODIFIERS.
+MODIFIERS is a list such as (control).  The position is what Emacs gives a
+fringe click: the window, the `left-fringe' area, the line's start."
+  (let ((pos (with-current-buffer (window-buffer window)
+               (save-excursion (goto-char (point-min))
+                               (forward-line (1- line))
+                               (point)))))
+    (list (event-convert-list (append modifiers '(mouse-1)))
+          (list window 'left-fringe '(0 . 0) 0 nil pos '(0 . 0) nil '(0 . 0) '(0 . 0)))))
+
+(defun codetracer-test--wait-new-session (known what)
+  "Wait for a session whose id is not in KNOWN; return it.  WHAT names it."
+  (let (found)
+    (codetracer-test--wait-for
+     (lambda ()
+       (setq found (cl-loop for s being the hash-values of codetracer--sessions
+                            unless (memq (codetracer-session-id s) known) return s)))
+     240 what)
+    found))
+
+(defun codetracer-test--session-ids ()
+  "The ids of the open sessions."
+  (hash-table-keys codetracer--sessions))
+
+(ert-deftest codetracer-test-source-tests-are-fringe-marks-that-record ()
+  "The file's tests are fringe marks on their lines; a click records one.
+A fringe click on another line, and a click in the text, are not taken."
+  :tags '(edit)
+  (codetracer-test--with-crate-session
+    (let* ((buffer (codetracer-test--visit-main session crate))
+           (window (get-buffer-window buffer))
+           (marks (codetracer-test--test-overlays buffer)))
+      ;; On each test's line, its `#[test]': a play mark, not yet run.
+      (should (equal (mapcar #'car marks) '(5 10)))
+      (should (equal (mapcar #'cadr marks) '(codetracer-test-play codetracer-test-play)))
+      (let* ((click (codetracer-test--fringe-event window 10))
+             (command (key-binding [left-fringe mouse-1] t nil (event-start click))))
+        (should (eq command #'codetracer-test-fringe-click))
+        ;; Not another line's fringe, not the text area.
+        (should-not (eq (key-binding [left-fringe mouse-1] t nil
+                                     (event-start (codetracer-test--fringe-event window 9)))
+                        #'codetracer-test-fringe-click))
+        (should-not (memq (key-binding [mouse-1] t nil (event-start click))
+                          '(codetracer-test-fringe-click codetracer-test-fringe-click-here)))
+        (let ((known (codetracer-test--session-ids))
+              (tabs (length (tab-bar-tabs))))
+          (funcall command click)
+          (let ((opened (codetracer-test--wait-new-session known "the clicked test's recording")))
+            (should (equal (codetracer-session-title opened) "test_fails"))
+            (should (= (length (tab-bar-tabs)) (1+ tabs)))
+            (should (eq (codetracer--current-tab-session) opened))
+            ;; The session it was recorded from is still open.
+            (should (codetracer--session (codetracer-session-id session)))))))))
+
+(ert-deftest codetracer-test-test-at-point-records-the-test-point-is-in ()
+  "`codetracer-test-at-point' in a test's body records that test, in a new tab.
+A buffer visiting the file opened later shows its tests at once."
+  :tags '(edit)
+  (codetracer-test--with-crate-session
+    (let ((buffer (codetracer-test--visit-main session crate))
+          (known (codetracer-test--session-ids)))
+      ;; Visited again later, the file shows the tests the session holds:
+      ;; the server does not send them again, as they have not changed.
+      (kill-buffer buffer)
+      (setq buffer (find-file-noselect (expand-file-name "src/main.nr" crate)))
+      (should (equal (mapcar #'car (codetracer-test--test-overlays buffer)) '(5 10)))
+      (with-current-buffer buffer
+        (goto-char (point-min))
+        ;; Line 1, above every test: there is none to record.
+        (should-error (codetracer-test-at-point) :type 'user-error)
+        (forward-line 6)                ; line 7, `main(1, 2);'
+        (codetracer-test-at-point))
+      (let ((opened (codetracer-test--wait-new-session known "the test at point's recording")))
+        (should (equal (codetracer-session-title opened) "test_passes"))
+        (should (codetracer--session (codetracer-session-id session)))))))
+
+(defvar codetracer-test--opened nil
+  "The `session/opened' notifications received, newest first.")
+
+(defun codetracer-test--record-opened (params)
+  "Record the `session/opened' PARAMS."
+  (push params codetracer-test--opened))
+
+(defun codetracer-test--check-replaced (session opened title)
+  "Check OPENED, the recording of TITLE, took SESSION's place."
+  (should (equal (codetracer-session-title opened) title))
+  (let ((announced (cl-find (codetracer-session-id opened) codetracer-test--opened
+                            :key (lambda (p) (plist-get p :session)))))
+    (should (equal (plist-get announced :placement) "current-tab"))
+    (should (eql (plist-get announced :replaces) (codetracer-session-id session))))
+  (should-not (codetracer--session (codetracer-session-id session)))
+  (should-not (tab-bar--tab-index-by-name (codetracer-session-tab session)))
+  (should (eq (codetracer--current-tab-session) opened)))
+
+(ert-deftest codetracer-test-test-at-point-here-replaces-the-session ()
+  "With a prefix argument, the test's recording takes the place of the session."
+  :tags '(edit)
+  (codetracer-test--with-crate-session
+    (let ((buffer (codetracer-test--visit-main session crate))
+          (known (codetracer-test--session-ids))
+          (codetracer-test--opened nil))
+      (advice-add 'codetracer--on-session-opened :before #'codetracer-test--record-opened)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (goto-char (point-min))
+              (forward-line 11)         ; line 12, `main(1, 1);'
+              (codetracer-test-at-point '(4)))
+            (codetracer-test--check-replaced
+             session (codetracer-test--wait-new-session known "the recording that replaces the session")
+             "test_fails"))
+        (advice-remove 'codetracer--on-session-opened #'codetracer-test--record-opened)))))
+
+(ert-deftest codetracer-test-ctrl-click-on-a-test-replaces-the-session ()
+  "A Ctrl+click on a test's fringe mark records it in place of the session."
+  :tags '(edit)
+  (codetracer-test--with-crate-session
+    (let* ((buffer (codetracer-test--visit-main session crate))
+           (click (codetracer-test--fringe-event (get-buffer-window buffer) 5 '(control)))
+           (command (key-binding [left-fringe C-mouse-1] t nil (event-start click)))
+           (known (codetracer-test--session-ids))
+           (codetracer-test--opened nil))
+      (should (eq command #'codetracer-test-fringe-click-here))
+      ;; The press before it is taken too: unbound, it would be the text
+      ;; area's buffer menu.
+      (should (eq (key-binding [left-fringe C-down-mouse-1] t nil (event-start click)) #'ignore))
+      (advice-add 'codetracer--on-session-opened :before #'codetracer-test--record-opened)
+      (unwind-protect
+          (progn
+            (funcall command click)
+            (codetracer-test--check-replaced
+             session (codetracer-test--wait-new-session known "the recording that replaces the session")
+             "test_passes"))
+        (advice-remove 'codetracer--on-session-opened #'codetracer-test--record-opened)))))
 
 (defun codetracer-test--png-size (data)
   "The (WIDTH . HEIGHT) a PNG's header in DATA declares."
