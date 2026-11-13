@@ -2054,7 +2054,8 @@ context menu offers the command."
 `codetracer-open' sends the folder as a project (Editor-Hosted-Front-Ends
 E9); `codetracer-view-generated-c' there compiles the saved file with the
 real `nim' on PATH, and the pane shows the C of the line at point -- far
-below the file's top, so shown means scrolled to."
+below the file's top, so shown means scrolled to.  A press on that C puts
+point back on the line."
   :tags '(native)
   (unless (executable-find "nim")
     (ert-fail "the edit-mode generated-C case needs `nim' on PATH"))
@@ -2092,7 +2093,31 @@ below the file's top, so shown means scrolled to."
                    120 "the compiled C of the line at point")
                 (ert-test-failed
                  (ert-fail (format "the pane does not show the line's C; it shows:\n%s"
-                                   (with-current-buffer pane (buffer-string)))))))))
+                                   (with-current-buffer pane (buffer-string))))))
+              ;; A press on the line's C puts point on its Nim line
+              ;; (`source/show' carries the position, Editor-Hosted E7).
+              ;; Point is elsewhere first, so the move is the press's.
+              (let ((source (codetracer--source-window session)))
+                (with-current-buffer (window-buffer source) (goto-char (point-min)))
+                (set-window-point source 1)
+                (with-current-buffer pane
+                  (goto-char (point-min))
+                  (should (search-forward (format "nimlf_(%d" codetracer-test--zebra-line) nil t))
+                  (beginning-of-line)
+                  (let ((match (text-property-search-forward
+                                'codetracer-hotspot nil
+                                (lambda (_ v) (and v (equal (car v) "low-level.go-to-source-line"))))))
+                    (should match)
+                    (goto-char (prop-match-beginning match))
+                    (codetracer-activate-hotspot)))
+                (codetracer-test--wait-for
+                 (lambda ()
+                   (with-current-buffer (window-buffer source)
+                     (= (line-number-at-pos (window-point source))
+                        codetracer-test--zebra-line)))
+                 15 "point on the Nim line the C came from")
+                (should (string-suffix-p "tiny.nim"
+                                         (buffer-file-name (window-buffer source))))))))
       (dolist (b (buffer-list))
         (when (and (buffer-file-name b) (string-prefix-p project (buffer-file-name b)))
           (with-current-buffer b (set-buffer-modified-p nil))

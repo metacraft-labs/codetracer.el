@@ -2459,14 +2459,35 @@ Emacs's own lock, backup and auto-save files are not the user's files."
                 nil)))
 
 (defun codetracer--on-source-show (params)
-  "Show the file PARAMS names in the source window: a pane opened it."
+  "Show the file PARAMS names in the source window: a pane opened it.
+When PARAMS names a place in it (`line', and `column' in UTF-8 bytes,
+both 1-based -- a press on an instruction of the generated C, a
+Problems row), point goes there."
   (when-let* ((session (codetracer--session (plist-get params :session)))
               (buffer (codetracer--source-buffer session (plist-get params :file))))
     (let ((window (codetracer--source-window session))
+          (line (plist-get params :line))
+          (column (plist-get params :column))
           (codetracer--realizing t))
       (set-window-dedicated-p window nil)
       (set-window-buffer window buffer)
+      (when (and (integerp line) (> line 0))
+        (with-current-buffer buffer
+          (let ((pos (codetracer--byte-position line (if (integerp column) column 1))))
+            (goto-char pos)
+            (set-window-point window pos))))
       (codetracer--sync-source-keys))))
+
+(defun codetracer--byte-position (line column)
+  "The position of 1-based LINE and 1-based UTF-8 byte COLUMN, clamped."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (let* ((start (point))
+           (end (line-end-position))
+           (text (encode-coding-string (buffer-substring-no-properties start end) 'utf-8))
+           (bytes (min (max 0 (1- column)) (length text))))
+      (+ start (length (decode-coding-string (substring text 0 bytes) 'utf-8))))))
 
 ;;;; Desktop
 
