@@ -149,6 +149,12 @@ or named by `codetracer-server-program`.
   from the recording, which bundles a native Nim program's generated C
   files and maps each run of C back to its Nim line by the compiler's
   `#line` directives.
+- `codetracer-toggle-macro-expansion` shows the code the Nim macro or
+  template call at point expanded to, in the Macro Expansion pane beside
+  the source. While the call is expanded, a step into the expansion stops
+  inside it: the source stays on the call's line and the pane marks the
+  expansion's row with `▸`. Run it again, or press `RET` on the pane's
+  heading, to close it. It is also in the Nim buffer's CodeTracer submenu.
 - `codetracer-dap-endpoint` names the pane server's DAP port, where a DAP
   client (dap-mode, dape) can attach and drive the same session.
 

@@ -2609,7 +2609,8 @@ Problems row), point goes there."
 
 (defconst codetracer--generated-code-items
   '(("View generated C" . codetracer-view-generated-c)
-    ("View disassembly" . codetracer-view-disassembly))
+    ("View disassembly" . codetracer-view-disassembly)
+    ("Toggle macro expansion" . codetracer-toggle-macro-expansion))
   "The generated-code entries of a Nim buffer's CodeTracer submenu.")
 
 (defun codetracer--nim-buffer-p (&optional buffer)
@@ -2686,6 +2687,20 @@ The trace reads the saved file."
   (interactive)
   (codetracer--run-at-point "view.disassembly"))
 
+;; Toggle Macro Expansion (Editor-Hosted-Front-Ends E15): the code the Nim
+;; macro or template call at point expanded to, in the Macro Expansion pane,
+;; which the server places beside the source when the expansion opens (its
+;; `layout/changed' opens the pane's window).  While the call is expanded, a
+;; step into the expansion stops inside it: the source stays on the call's
+;; line and the pane marks the row with `▸'.  The pane's heading closes it.
+
+(defun codetracer-toggle-macro-expansion ()
+  "Show or close the expansion of the Nim macro call at point.
+The expansion is shown in the Macro Expansion pane beside the source; a
+line that expands nothing is refused with the reason."
+  (interactive)
+  (codetracer--run-at-point "editor.toggle-macro-expansion"))
+
 (defun codetracer--at-click (click command)
   "A command running COMMAND with point where CLICK was."
   (lambda ()
@@ -2699,8 +2714,9 @@ The trace reads the saved file."
   "Add CodeTracer's Nim tracing to MENU, the context menu CLICK opened.
 In a Nim buffer while a CodeTracer session is open, a \"CodeTracer\"
 submenu traces the macro, the static block or the constant at the click,
-evaluates the file with `nim e', or shows the click's line's generated C
-or the stop's disassembly; the click's position becomes point
+evaluates the file with `nim e', shows the click's line's generated C or
+the stop's disassembly, or toggles the expansion of the macro call at the
+click; the click's position becomes point
 before the item runs.  Anywhere else MENU is left as it is.  This is an
 entry of `context-menu-functions', added while the pane server runs."
   (let* ((window (posn-window (event-start click)))

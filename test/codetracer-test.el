@@ -2124,5 +2124,124 @@ point back on the line."
           (kill-buffer b)))
       (delete-directory project t))))
 
+;;;; Toggle Macro Expansion (Editor-Hosted-Front-Ends E15)
+
+(defconst codetracer-test--before-macro-call 16
+  "`var counter = 0' in nim_macro_steps/main.nim, the line before the call.")
+
+(defconst codetracer-test--macro-call 17
+  "`addTwice(counter, 3)' in nim_macro_steps/main.nim.")
+
+(defun codetracer-test--pane-text (session pane)
+  "The text of SESSION's PANE buffer, or nil."
+  (when-let ((buffer (gethash pane (codetracer-session-panes session))))
+    (with-current-buffer buffer (buffer-string))))
+
+(defun codetracer-test--at-main (session line)
+  "Non-nil when SESSION is stopped at main.nim:LINE."
+  (let ((position (codetracer-session-position session)))
+    (and (stringp (plist-get position :file))
+         (string-match-p "/main\\.nim\\'" (plist-get position :file))
+         (eql (plist-get position :line) line))))
+
+(ert-deftest codetracer-test-macro-expansion-beside-the-source ()
+  "Toggle Macro Expansion shows a Nim macro call's expansion, and a step in it.
+Over the `ct record' recording of CodeTracer's nim_macro_steps program:
+`addTwice(counter, 3)' on line 17 expands to expanded.nim lines 1-4.  The
+command at point on the call opens the Macro Expansion pane, which the
+server places beside the source; a step from line 16 stops inside the
+expansion, the source staying on the call and the pane marking the row; a
+press on the pane's heading closes the expansion.  The Nim buffer's context
+menu offers the command."
+  :tags '(macro)
+  (codetracer-test--env "CODETRACER_CT_NATIVE_REPLAY_CMD")
+  (codetracer-test--with-server
+    (let* ((recording (codetracer-test--env "CODETRACER_TEST_NIM_MACRO_TRACE"))
+           (session (codetracer-open recording)))
+      (codetracer-test--wait-for
+       (lambda () (plist-get (codetracer-session-position session) :file))
+       120 "the session's first stop")
+      ;; To the line before the call by a breakpoint there and Continue: one
+      ;; move, where stepping through the program's start takes twenty (each
+      ;; many seconds on this recording's replay).
+      (codetracer-test--wait-for
+       (lambda () (window-live-p (codetracer--source-window session))) 60 "the source window")
+      (select-window (codetracer--source-window session))
+      (with-current-buffer (window-buffer (selected-window))
+        (goto-char (point-min))
+        (forward-line (1- codetracer-test--before-macro-call))
+        (should (codetracer--run-at-point "editor.toggle-breakpoint")))
+      (let ((moved (codetracer-session-position session)))
+        (codetracer--run "debugger.continue" :session (codetracer-session-id session))
+        (codetracer-test--wait-for
+         (lambda () (not (equal (codetracer-session-position session) moved)))
+         120 "the stop at the breakpoint"))
+      (should (codetracer-test--at-main session codetracer-test--before-macro-call))
+      (codetracer-test--settle)
+      (should-not (codetracer-test--pane-window session "macroExpansion"))
+      (let ((window (codetracer--source-window session)))
+        (should (window-live-p window))
+        (select-window window)
+        (with-current-buffer (window-buffer window)
+          (should (codetracer--nim-buffer-p))
+          (goto-char (point-min))
+          (forward-line (1- codetracer-test--macro-call))
+          (forward-char 2)
+          (let ((submenu (codetracer-test--menu-binding
+                          (context-menu-map
+                           (codetracer-test--right-click window (point)))
+                          'codetracer)))
+            (should (keymapp submenu))
+            (should (codetracer-test--menu-binding
+                     submenu 'codetracer-toggle-macro-expansion)))
+          (should (eq (plist-get (codetracer-toggle-macro-expansion) :ok) t))))
+      (codetracer-test--wait-for
+       (lambda () (codetracer-test--pane-window session "macroExpansion"))
+       60 "the Macro Expansion window the layout now places")
+      (condition-case nil
+          (codetracer-test--wait-for
+           (lambda ()
+             (let ((text (codetracer-test--pane-text session "macroExpansion")))
+               (and text
+                    (string-match-p (regexp-quote "main.nim:17 · expanded.nim 1–4") text)
+                    (string-match-p (regexp-quote "counter += 3") text))))
+           60 "the expansion's heading and lines")
+        (ert-test-failed
+         (ert-fail (format "the pane does not show the expansion; it shows:\n%s"
+                           (codetracer-test--pane-text session "macroExpansion")))))
+      ;; Expanded, the step from line 16 is inside the expansion.
+      (let ((moved (codetracer-session-position session)))
+        (codetracer--run "debugger.step-into" :session (codetracer-session-id session))
+        ;; A step of this recording's replay can take 20 s on a busy host.
+        (codetracer-test--wait-for
+         (lambda () (not (equal (codetracer-session-position session) moved)))
+         120 "the step"))
+      (should (codetracer-test--at-main session codetracer-test--macro-call))
+      (condition-case nil
+          (codetracer-test--wait-for
+           (lambda ()
+             (let ((text (or (codetracer-test--pane-text session "macroExpansion") "")))
+               (string-match-p "▸.*counter \\+= 3" text)))
+           30 "the execution row in the pane")
+        (ert-test-failed
+         (ert-fail (format "the pane does not mark the row; it shows:\n%s"
+                           (codetracer-test--pane-text session "macroExpansion")))))
+      ;; The heading's press closes it.
+      (let ((pane (gethash "macroExpansion" (codetracer-session-panes session))))
+        (with-current-buffer pane
+          (goto-char (point-min))
+          (let ((match (text-property-search-forward
+                        'codetracer-hotspot nil
+                        (lambda (_ v) (and v (equal (car v) "editor.toggle-macro-expansion"))))))
+            (should match)
+            (goto-char (prop-match-beginning match))
+            (codetracer-activate-hotspot))))
+      (codetracer-test--wait-for
+       (lambda ()
+         ;; The pane's empty-state words, cut to its window's width.
+         (string-match-p (regexp-quote "Toggle Macro")
+                         (or (codetracer-test--pane-text session "macroExpansion") "")))
+       30 "the pane with no expansion open"))))
+
 (provide 'codetracer-test)
 ;;; codetracer-test.el ends here

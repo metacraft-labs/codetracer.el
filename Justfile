@@ -45,6 +45,13 @@
 #   CODETRACER_CT_NATIVE_REPLAY_CMD   the native backend (`ct-native-replay`)
 # and, for its edit-mode case (a project folder, no recording, its Nim file
 # compiled to C now), `nim` on PATH.
+#
+# `test-macro` toggles the expansion of a Nim macro call into the Macro
+# Expansion pane and steps inside it (Editor-Hosted-Front-Ends E15). Besides
+# CODETRACER_TUI, CODETRACER_TEST_TRACE and the native backend it needs:
+#   CODETRACER_TEST_NIM_MACRO_TRACE  the `ct record` recording of CodeTracer's
+#                                    test-programs/nim_macro_steps/main.nim
+#   CODETRACER_CT_MCR_CMD            the recorder it replays with (`ct-mcr`)
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -79,6 +86,10 @@ test-nim:
 # A Nim line's generated C, from a native recording (see above).
 test-native:
     {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag native)))'
+
+# Toggle Macro Expansion over a Nim macro call (see above).
+test-macro:
+    {{emacs}} -l test/codetracer-test.el --eval '(ert-run-tests-batch-and-exit (quote (tag macro)))'
 
 lint: lint-elisp lint-nix
 
