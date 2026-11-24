@@ -6,6 +6,9 @@ on:
     # no CI by policy: work landing there runs the same recipes locally.
     branches: [dev, stable]
   pull_request:
+    # Named bases: an unfiltered trigger also runs on pull requests into `agents`,
+    # which runs no CI (branching policy, "`agents` Has No CI").
+    branches: [dev, stable]
 
 jobs:
   # Every job runs a `just` recipe inside the flake's dev shell, so a failure
