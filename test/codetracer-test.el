@@ -55,6 +55,33 @@
   (should (equal (codetracer--emacs-key "Ctrl+Shift+F10") "C-S-<f10>"))
   (should-not (codetracer--emacs-key "Hyper+x")))
 
+;; A text terminal (batch Emacs is one) has no fringes: the execution
+;; line's and a breakpoint's marks are glyphs in a left margin there, beside
+;; the fringe bitmaps a graphical frame draws.
+(ert-deftest codetracer-test-marks-in-the-margin-on-a-text-terminal ()
+  :tags '(unit)
+  (should-not (display-graphic-p))
+  (with-temp-buffer
+    (insert "first\nsecond\nthird\n")
+    (set-window-buffer (selected-window) (current-buffer))
+    (let ((session (codetracer--make-session :id 7)))
+      (codetracer--mark-execution session (current-buffer)
+                                  (save-excursion (goto-char (point-min))
+                                                  (forward-line 1) (point)))
+      (let* ((ov (car (gethash (cons :execution 7) (codetracer-session-decorations session))))
+             (string (overlay-get ov 'before-string))
+             (specs (cl-loop for i below (length string)
+                             collect (get-text-property i 'display string))))
+        (should (= (line-number-at-pos (overlay-start ov)) 2))
+        ;; the fringe bitmap is still there for a graphical frame
+        (should (cl-find-if (lambda (d) (eq (car-safe d) 'left-fringe)) specs))
+        ;; and the glyph is in the margin, which the buffer and its window have
+        (let ((margin (cl-find-if (lambda (d) (equal (car-safe d) '(margin left-margin))) specs)))
+          (should margin)
+          (should (equal (substring-no-properties (nth 1 margin)) "▶")))
+        (should (>= left-margin-width 1))
+        (should (>= (or (car (window-margins (selected-window))) 0) 1))))))
+
 ;; A text terminal keeps a window's last column for the truncation glyph:
 ;; a pane is asked for the columns its rows fill without being cut.
 (ert-deftest codetracer-test-pane-columns-leave-the-truncation-column ()

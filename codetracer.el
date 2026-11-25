@@ -1919,9 +1919,28 @@ window, when it is a source: a file, or a source read from the recording."
               #b11111111 #b11111111 #b01111110 #b00111100]
   nil nil 'center)
 
-(defun codetracer--fringe-string (bitmap face)
-  "A `before-string' drawing BITMAP in the left fringe with FACE."
-  (propertize " " 'display `(left-fringe ,bitmap ,face)))
+(defun codetracer--fringe-string (bitmap face &optional glyph)
+  "A `before-string' drawing BITMAP in the left fringe with FACE.
+A text terminal has no fringes, so there GLYPH, when given, is drawn
+in the left margin instead, in FACE, as Flymake does on one: see
+`codetracer--ensure-mark-margin'."
+  (concat (propertize " " 'display `(left-fringe ,bitmap ,face))
+          (if (and glyph (not (display-graphic-p)))
+              (propertize " " 'display `((margin left-margin)
+                                         ,(propertize glyph 'face face)))
+            "")))
+
+(defun codetracer--ensure-mark-margin (buffer)
+  "Give BUFFER a one-column left margin when the frame is a text terminal.
+CodeTracer draws the execution line and the breakpoints as fringe
+bitmaps, which a text terminal does not show; there their glyphs go in
+this margin instead.  A margin the buffer already has is kept."
+  (unless (display-graphic-p)
+    (with-current-buffer buffer
+      (when (< (or left-margin-width 0) 1)
+        (setq-local left-margin-width 1)
+        (dolist (window (get-buffer-window-list buffer nil t))
+          (set-window-margins window left-margin-width right-margin-width))))))
 
 (defun codetracer--source-window (session)
   "The window SESSION's source is shown in.
@@ -1972,10 +1991,12 @@ window when it is not a side window, else any live window that is not."
     (with-current-buffer buffer
       (save-excursion
         (goto-char pos)
+        (codetracer--ensure-mark-margin buffer)
         (let ((ov (make-overlay (line-beginning-position) (1+ (line-end-position)))))
           (overlay-put ov 'face 'codetracer-execution-line)
           (overlay-put ov 'before-string
-                       (codetracer--fringe-string 'right-triangle 'codetracer-execution-fringe))
+                       (codetracer--fringe-string 'right-triangle 'codetracer-execution-fringe
+                                                  "▶"))
           (overlay-put ov 'codetracer t)
           (overlay-put ov 'priority 10)
           (puthash key (list ov) (codetracer-session-decorations session)))))))
@@ -2028,13 +2049,15 @@ The server answers with that file's decorations and its tests."
                 (let ((bol (line-beginning-position)) (eol (line-end-position)))
                   (pcase (plist-get row :mark)
                     ((and (pred stringp) mark (guard (not (string-empty-p mark))))
+                     (codetracer--ensure-mark-margin buffer)
                      (let ((ov (make-overlay bol bol)))
                        (overlay-put ov 'before-string
                                     (codetracer--fringe-string
                                      'codetracer-breakpoint
                                      (if (equal mark "tracepoint")
                                          'codetracer-tracepoint-fringe
-                                       'codetracer-breakpoint-fringe)))
+                                       'codetracer-breakpoint-fringe)
+                                     (if (equal mark "tracepoint") "◆" "●")))
                        (overlay-put ov 'codetracer-mark mark)
                        (push ov overlays))))
                   (let ((values (append (plist-get row :values) nil))
