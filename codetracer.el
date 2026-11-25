@@ -1204,6 +1204,14 @@ Sent at once, even while a sizes-only report is in flight."
 
 ;;;; Pane sizes
 
+(defun codetracer--pane-columns (window)
+  "The columns of WINDOW a pane's rows can fill without being cut.
+On a text terminal, which has no fringes, Emacs keeps the last column
+of a window for its truncation and continuation glyphs, so a row as
+wide as the body would end in `$'; `window-max-chars-per-line' leaves
+that column, and any line numbers, out."
+  (window-max-chars-per-line window))
+
 (defun codetracer--sync-pane-size (window)
   "Tell the server the size of WINDOW's pane, if it changed.
 A pane that is not open is opened (`pane/open') at once.  An open one
@@ -1217,7 +1225,7 @@ most one repaint and the size the drag stops at is the last one sent."
   (let ((buffer (window-buffer window)))
     (with-current-buffer buffer
       (when codetracer--pane
-        (let ((size (cons (max 1 (window-body-width window))
+        (let ((size (cons (max 1 (codetracer--pane-columns window))
                           (max 1 (window-body-height window))))
               (params (lambda (size)
                         `(:session ,codetracer--pane-session
@@ -1270,8 +1278,8 @@ the pane was closed meanwhile."
           (when (and session (eql codetracer--pane-session (codetracer-session-id session))
                      codetracer--pane-open
                      (not (equal codetracer--pane-size
-                                 (cons (window-body-width window)
-                                       (window-body-height window)))))
+                                 (cons (max 1 (codetracer--pane-columns window))
+                                       (max 1 (window-body-height window))))))
             (setq changed t)
             (codetracer--sync-pane-size window))))
       (when (and changed session (not codetracer--realizing))

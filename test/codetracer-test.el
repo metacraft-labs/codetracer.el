@@ -55,6 +55,16 @@
   (should (equal (codetracer--emacs-key "Ctrl+Shift+F10") "C-S-<f10>"))
   (should-not (codetracer--emacs-key "Hyper+x")))
 
+;; A text terminal keeps a window's last column for the truncation glyph:
+;; a pane is asked for the columns its rows fill without being cut.
+(ert-deftest codetracer-test-pane-columns-leave-the-truncation-column ()
+  :tags '(unit)
+  (should-not (display-graphic-p))
+  (with-temp-buffer
+    (set-window-buffer (selected-window) (current-buffer))
+    (let ((w (selected-window)))
+      (should (= (codetracer--pane-columns w) (1- (window-body-width w)))))))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
   (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x"))
@@ -653,7 +663,7 @@ ordinary window is left to keep, so window parameters are ignored."
          (with-current-buffer (window-buffer w)
            (should codetracer--pane-open)
            (should (equal codetracer--pane-size
-                          (cons (window-body-width w) (window-body-height w))))))
+                          (cons (codetracer--pane-columns w) (window-body-height w))))))
        (with-current-buffer (gethash "calltrace" (codetracer-session-panes session))
          (should (> (buffer-size) 0)))
        ;; The user's source window is kept.
@@ -714,7 +724,7 @@ ordinary window is left to keep, so window parameters are ignored."
      (codetracer--on-window-size-change (selected-frame))
      (codetracer-test--settle)
      (with-current-buffer (window-buffer window)
-       (should (equal codetracer--pane-size (cons (window-body-width window) (- height 4))))
+       (should (equal codetracer--pane-size (cons (codetracer--pane-columns window) (- height 4))))
        ;; The pane holds exactly the rows that fit.
        (should (= (count-lines (point-min) (point-max)) (- height 4)))))))
 
@@ -1066,7 +1076,7 @@ transport's own send; nothing is changed on the way."
   "Non-nil when WINDOW's pane is painted at the window's size, nothing pending."
   (with-current-buffer (window-buffer window)
     (and (not (codetracer-test--resize-pending-p (current-buffer)))
-         (equal codetracer--pane-size (cons (window-body-width window)
+         (equal codetracer--pane-size (cons (codetracer--pane-columns window)
                                             (window-body-height window)))
          (= (count-lines (point-min) (point-max)) (window-body-height window)))))
 
@@ -1194,7 +1204,7 @@ sooner than the server repaints."
      (message "drag: %d rows to %d in %d steps, %d pane/resize, %d layout/edited, settled %.0f ms after the start"
               height final steps resizes reports (* 1000 (- settled started)))
      (with-current-buffer (window-buffer window)
-       (should (equal codetracer--pane-size (cons (window-body-width window) final))))
+       (should (equal codetracer--pane-size (cons (codetracer--pane-columns window) final))))
      ;; Sending every size is one request per step; one in flight at a time
      ;; is the first size and the last.
      (should (> resizes 0))
