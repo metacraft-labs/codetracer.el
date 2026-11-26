@@ -1574,6 +1574,14 @@ of every escape sequence the terminal sends (arrows, function keys and
 xterm mouse reports), and binding it as a key of its own ends each of
 those sequences at its first byte.")
 
+(defconst codetracer--terminal-sequence-keys '("M-[" "M-O")
+  "Keys a text terminal cannot be given: the starts of its own sequences.
+A terminal sends ESC [ before an arrow, a function key and every xterm
+mouse report, and ESC O before some function keys, so Meta with [ and
+Meta with O are the first two bytes of those.  Bound in a pane, Meta
+with [ (Inbox: Previous Item) ran on the release of a click instead of
+the click.")
+
 (defconst codetracer--modifiers
   '(("Ctrl" . "C-") ("Control" . "C-") ("Alt" . "M-") ("Meta" . "M-")
     ("Shift" . "S-") ("Super" . "s-") ("Cmd" . "s-"))
@@ -1601,7 +1609,10 @@ Nil when there is no Emacs spelling for it."
                          (fkey fkey)
                          ((= (length base) 1) base)))
              (spelled (and name (concat (apply #'concat mods) name))))
-        (and spelled (key-valid-p spelled) spelled)))))
+        (and spelled (key-valid-p spelled)
+             (not (and (member spelled codetracer--terminal-sequence-keys)
+                       (not (display-graphic-p))))
+             spelled)))))
 
 (defun codetracer--codetracer-key (event)
   "EVENT in the CodeTracer keymap's spelling, or nil."

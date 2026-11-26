@@ -120,6 +120,16 @@
                    '("CodeTracer: broken.nim(2, 21) Error: type mismatch"
                      "CodeTracer: the trace recorded nothing")))))
 
+;; M-[ is ESC [, the start of every mouse report and arrow key a text
+;; terminal sends: a pane that bound it read a click's release as that key.
+(ert-deftest codetracer-test-no-terminal-sequence-keys-on-a-terminal ()
+  :tags '(unit)
+  (should-not (display-graphic-p))
+  (should-not (codetracer--emacs-key "Alt+["))
+  (should-not (codetracer--emacs-key "Alt+O"))
+  (should (equal (codetracer--emacs-key "Alt+]") "M-]"))
+  (should (equal (codetracer--emacs-key "Alt+Left") "M-<left>")))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
   (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x" "Escape"))
