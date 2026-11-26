@@ -743,11 +743,19 @@ as a notification handler must."
       (equal (codetracer--node-pane node) "editor")
     (cl-some #'codetracer--holds-editor-p (codetracer--node-children node))))
 
-(defun codetracer--visible-leaves (node path share)
+(defun codetracer--visible-leaves (node path share &optional across)
   "Return the servable panes NODE displays, as (PANE PATH SHARE REGION-PATH) lists.
 PATH is NODE's path from the root, SHARE the fraction of its side it
 covers.  REGION-PATH is the path of the node whose weight sizes the pane:
-the pane's own, or its stack's."
+the pane's own, or its stack's.
+
+ACROSS is the kind of container (\"row\" or \"column\") whose children
+lie across the side rather than along it: a row in a left or right side.
+A side window cannot be split, so those children are shown one after
+the other along the side, and each keeps the whole share the container
+has -- in the layout each spans all of it -- rather than a part of it.
+Dividing it gave the State and Call Trace panes of the debug layout's
+right column a quarter of the side each, too few rows to read State."
   (pcase (codetracer--node-kind node)
     ("pane"
      (let ((pane (codetracer--node-pane node)))
@@ -760,8 +768,9 @@ the pane's own, or its stack's."
             (kid (nth active kids)))
        (when kid
          (mapcar (lambda (leaf) (list (nth 0 leaf) (nth 1 leaf) (nth 2 leaf) path))
-                 (codetracer--visible-leaves kid (append path (list active)) share)))))
-    (_
+                 (codetracer--visible-leaves kid (append path (list active)) share
+                                             across)))))
+    (kind
      (let* ((kids (codetracer--node-children node))
             (total (apply #'+ (mapcar #'codetracer--node-weight kids)))
             (i -1))
@@ -769,9 +778,12 @@ the pane's own, or its stack's."
                 do (cl-incf i)
                 append (codetracer--visible-leaves
                         kid (append path (list i))
-                        (* share (if (> total 0)
-                                     (/ (codetracer--node-weight kid) total)
-                                   (/ 1.0 (length kids))))))))))
+                        (if (equal kind across)
+                            share
+                          (* share (if (> total 0)
+                                       (/ (codetracer--node-weight kid) total)
+                                     (/ 1.0 (length kids)))))
+                        across))))))
 
 (defun codetracer--sides (layout)
   "Return LAYOUT's sides: a list of (SIDE SIZE-FRACTION PANE-LIST PATH).
@@ -784,7 +796,7 @@ editor -- the Low Level Code pane an operation places, say -- is one), so
 one SIDE symbol may come more than once, the outer node first."
   (if (not (member (codetracer--node-kind layout) '("row" "column")))
       ;; A layout that is one pane or one stack: a side of its own.
-      (list (list 'right 0.5 (codetracer--visible-leaves layout nil 1.0) nil))
+      (list (list 'right 0.5 (codetracer--visible-leaves layout nil 1.0 "row") nil))
     (codetracer--sides-around-editor layout nil 1.0 1.0)))
 
 (defun codetracer--sides-around-editor (node path width height)
@@ -809,7 +821,10 @@ inside it follow."
                                        (if (and editor (< i editor)) 'left 'right)
                                      (if (and editor (< i editor)) 'top 'bottom))
                                    (* fraction (if row width height))
-                                   (codetracer--visible-leaves kid (append path (list i)) 1.0)
+                                   ;; a left or right side is a column of
+                                   ;; slots: a row in it lies across it
+                                   (codetracer--visible-leaves kid (append path (list i)) 1.0
+                                                               (if row "row" "column"))
                                    (append path (list i)))))))
     (if-let* ((editor)
               (inner (nth editor kids))

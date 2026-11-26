@@ -203,9 +203,13 @@
        (should (equal (mapcar #'car leaves) '("state" "calltrace" "eventLog")))
        (should (equal (mapcar (lambda (l) (nth 3 l)) leaves)
                       '((2 0 0) (2 0 1) (2 1))))
-       ;; Shares: the product of the weights' fractions down the path.
-       (should (< (abs (- (apply #'+ (mapcar (lambda (l) (nth 2 l)) leaves)) 1.0)) 1e-9))
-       (should (< (abs (- (nth 2 (nth 2 leaves)) (/ 29.0 58.0))) 1e-9)))
+       ;; Shares: the product of the weights' fractions down the path --
+       ;; except across the side: State and Call Trace sit side by side in
+       ;; the layout's row, so each keeps the row's whole share, and the
+       ;; side is shared three ways rather than a quarter, a quarter and a
+       ;; half (State had 10 rows at 200x50 then, too few to read it).
+       (dolist (l leaves)
+         (should (< (abs (- (nth 2 l) (/ 29.0 58.0))) 1e-9))))
      (should (< (abs (- (nth 1 (nth 0 sides)) (/ 28.0 200.0))) 1e-9)))))
 
 (ert-deftest codetracer-test-sides-beside-the-editor ()
