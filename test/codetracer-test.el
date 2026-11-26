@@ -105,6 +105,21 @@
     (should-not (lookup-key map (kbd "ESC")))
     (should (eq (lookup-key map [escape]) #'ignore))))
 
+;; A trace that records nothing opens no session: `trace/settled' is what
+;; replaces "Tracing..." in the echo area with how it ended.
+(ert-deftest codetracer-test-trace-settled-is-shown ()
+  :tags '(unit)
+  (let ((shown nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) shown))))
+      (codetracer--dispatch nil 'trace/settled
+                            '(:session 1 :outcome "failed"
+                                       :message "broken.nim(2, 21) Error: type mismatch"))
+      (codetracer--dispatch nil 'trace/settled '(:session 1 :outcome "failed" :message "")))
+    (should (equal (reverse shown)
+                   '("CodeTracer: broken.nim(2, 21) Error: type mismatch"
+                     "CodeTracer: the trace recorded nothing")))))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
   (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x" "Escape"))

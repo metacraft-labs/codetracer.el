@@ -511,7 +511,23 @@ be a local process's: the home directory is used then."
       ('session/opened (codetracer--on-session-opened params))
       ('controls/state (codetracer--on-controls-state params))
       ('source/tests (codetracer--on-source-tests params))
+      ('trace/settled (codetracer--on-trace-settled params))
       (_ nil))))
+
+(defun codetracer--on-trace-settled (params)
+  "Say how a Nim trace ended: PARAMS, a `trace/settled' notification.
+Its start was the answer to the operation (\"Tracing macro
+expansion...\"); a trace that records nothing -- the compiler refused
+it, or it failed -- opens no session, so without this the echo area
+kept saying \"Tracing...\".  A recording that opened is announced by
+`session/opened' as well."
+  (let ((text (plist-get params :message)))
+    (message "CodeTracer: %s"
+             (if (and (stringp text) (not (string-empty-p text)))
+                 text
+               (if (equal (plist-get params :outcome) "done")
+                   "the trace is recorded"
+                 "the trace recorded nothing")))))
 
 ;;;; Sessions and tabs
 
