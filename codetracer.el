@@ -1532,12 +1532,16 @@ precedence over `codetracer-pane-user-map' and CodeTracer's keymap."
     (if (and (symbolp map) (boundp map)) (symbol-value map) map)))
 
 (defconst codetracer--named-keys
-  '(("Enter" . "RET") ("Return" . "RET") ("Escape" . "ESC") ("Esc" . "ESC")
+  '(("Enter" . "RET") ("Return" . "RET") ("Escape" . "<escape>") ("Esc" . "<escape>")
     ("Tab" . "TAB") ("Space" . "SPC") ("Backspace" . "DEL")
     ("Up" . "<up>") ("Down" . "<down>") ("Left" . "<left>") ("Right" . "<right>")
     ("PageUp" . "<prior>") ("PageDown" . "<next>") ("Home" . "<home>")
     ("End" . "<end>") ("Delete" . "<delete>") ("Insert" . "<insert>"))
-  "CodeTracer's spelling of named keys, and Emacs's.")
+  "CodeTracer's spelling of named keys, and Emacs's.
+Escape is `<escape>', never ESC: on a text terminal ESC is the prefix
+of every escape sequence the terminal sends (arrows, function keys and
+xterm mouse reports), and binding it as a key of its own ends each of
+those sequences at its first byte.")
 
 (defconst codetracer--modifiers
   '(("Ctrl" . "C-") ("Control" . "C-") ("Alt" . "M-") ("Meta" . "M-")

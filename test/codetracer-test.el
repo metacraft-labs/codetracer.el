@@ -92,9 +92,22 @@
     (let ((w (selected-window)))
       (should (= (codetracer--pane-columns w) (1- (window-body-width w)))))))
 
+;; ESC starts every escape sequence a text terminal sends; a pane that
+;; bound it as a key ended a mouse click's report at its first byte (the
+;; rest arrived as keys: "m is undefined").
+(ert-deftest codetracer-test-escape-is-not-the-escape-prefix ()
+  :tags '(unit)
+  (should (equal (codetracer--emacs-key "Escape") "<escape>"))
+  (should (equal (codetracer--emacs-key "Esc") "<escape>"))
+  (should (equal (codetracer--emacs-key "Ctrl+Escape") "C-<escape>"))
+  (let ((map (make-sparse-keymap)))
+    (keymap-set map (codetracer--emacs-key "Escape") #'ignore)
+    (should-not (lookup-key map (kbd "ESC")))
+    (should (eq (lookup-key map [escape]) #'ignore))))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
-  (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x"))
+  (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x" "Escape"))
     (let ((events (key-parse (codetracer--emacs-key key))))
       (should (equal (codetracer--codetracer-key (aref events 0)) key)))))
 
