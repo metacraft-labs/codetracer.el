@@ -1698,6 +1698,18 @@ BEFORE is the format it replaced, AFTER the one it set; nil otherwise.")
   "Non-nil when `tab-bar-format' is Emacs's default."
   (equal tab-bar-format (eval (car (get 'tab-bar-format 'standard-value)) t)))
 
+(defun codetracer-tab-bar-align-right ()
+  "Align the tab bar's items after this one to its right, on a graphical frame.
+That is `tab-bar-format-align-right'.  A text terminal finds the item
+under a click on the tab bar by adding up the lengths of the captions
+before it, and that function's caption is one character displayed as
+many columns, so a click on a control after it reached nothing (and
+padding with real spaces fights the variable `tab-bar-auto-width').  On a text
+terminal the controls therefore follow the tabs, where a click finds
+them."
+  (when (display-graphic-p)
+    (tab-bar-format-align-right)))
+
 (defun codetracer--sync-controls ()
   "Take `tab-bar-format' for the controls while sessions are open.
 It is given back when the last one closes.  The format is taken only
@@ -1709,7 +1721,7 @@ CodeTracer set."
                  (memq 'codetracer-tab-bar-controls tab-bar-format)))
             ((codetracer--default-tab-bar-format-p)
              (let ((after (append tab-bar-format
-                                  '(tab-bar-format-align-right codetracer-tab-bar-controls))))
+                                  '(codetracer-tab-bar-align-right codetracer-tab-bar-controls))))
                (setq codetracer--tab-bar-format-taken (cons tab-bar-format after)
                      tab-bar-format after)))
             ((not codetracer--tab-bar-format-offered)

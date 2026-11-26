@@ -467,6 +467,28 @@
     (setf (codetracer-session-tab session) "not this tab")
     (should-not (codetracer-tab-bar-controls))))
 
+;; A text terminal (batch Emacs is one) finds the tab-bar item under a click
+;; by adding up the lengths of the captions before it: every caption before
+;; the controls must be as long as it is wide, or the click misses them
+;; (`tab-bar-format-align-right''s is one character drawn as many columns).
+(ert-deftest codetracer-test-tab-bar-controls-clickable-on-a-text-terminal ()
+  :tags '(unit)
+  (should-not (display-graphic-p))
+  (let* ((codetracer--sessions (make-hash-table))
+         (codetracer--tab-bar-format-taken nil)
+         (codetracer--tab-bar-format-offered t)
+         (codetracer-controls 'tab-bar)
+         (tab-bar-format (copy-sequence
+                          (eval (car (get 'tab-bar-format 'standard-value)) t))))
+    (puthash 1 (codetracer--make-session :id 1) codetracer--sessions)
+    (codetracer--sync-controls)
+    (let ((items (tab-bar-format-list tab-bar-format)))
+      (should-not (assq 'align-right items))
+      (dolist (item items)
+        (should-not (text-property-not-all 0 (length (nth 2 item)) 'display nil (nth 2 item)))))
+    (clrhash codetracer--sessions)
+    (codetracer--sync-controls)))
+
 (ert-deftest codetracer-test-tab-bar-format-taken-and-given-back ()
   "The default `tab-bar-format' gets the controls while sessions are open; a
 format of the user's own is left alone."
@@ -479,7 +501,7 @@ format of the user's own is left alone."
          (tab-bar-format (copy-sequence default)))
     (puthash 1 (codetracer--make-session :id 1) codetracer--sessions)
     (codetracer--sync-controls)
-    (should (equal tab-bar-format (append default '(tab-bar-format-align-right
+    (should (equal tab-bar-format (append default '(codetracer-tab-bar-align-right
                                                     codetracer-tab-bar-controls))))
     ;; Once only.
     (codetracer--sync-controls)
@@ -1390,12 +1412,13 @@ tab bar's format is given back when the last session closes."
          (should (cl-find "next" buttons :key (lambda (b) (plist-get b :id)) :test #'equal))
          ;; The format is the default one with the controls at its right.
          (should (equal (last tab-bar-format 2)
-                        '(tab-bar-format-align-right codetracer-tab-bar-controls)))
+                        '(codetracer-tab-bar-align-right codetracer-tab-bar-controls)))
          ;; Built into the tab bar: the Next glyph, a button running Next.
          (let ((next (codetracer-test--tab-bar-item 'codetracer-control-next)))
            (should next)
            (should (string-match-p "↷" (nth 2 next)))
-           (should (codetracer-test--tab-bar-item 'align-right))
+           ;; right-aligned on a graphical frame; after the tabs on a terminal
+           (should (eq (and (codetracer-test--tab-bar-item 'align-right) t) (display-graphic-p)))
            (let ((tick (codetracer-test--tick session)))
              ;; What `tab-bar-mouse-down-1' does with a click on the item.
              (call-interactively (nth 3 next))
