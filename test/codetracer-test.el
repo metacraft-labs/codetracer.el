@@ -130,6 +130,36 @@
   (should (equal (codetracer--emacs-key "Alt+]") "M-]"))
   (should (equal (codetracer--emacs-key "Alt+Left") "M-<left>")))
 
+;; A trace opened from a session shows the same file: only the current tab's
+;; session draws its execution line there.
+(ert-deftest codetracer-test-execution-line-of-the-current-tab-only ()
+  :tags '(unit)
+  (with-temp-buffer
+    (insert "a\nb\nc\nd\n")
+    (let* ((codetracer--sessions (make-hash-table))
+           (one (codetracer--make-session :id 1))
+           (two (codetracer--make-session :id 2))
+           (current one)
+           (line (lambda (n) (save-excursion (goto-char (point-min))
+                                             (forward-line (1- n)) (point))))
+           (drawn (lambda (session)
+                    (let ((ov (car (gethash (cons :execution (codetracer-session-id session))
+                                            (codetracer-session-decorations session)))))
+                      (and (overlay-get ov 'before-string) t)))))
+      (puthash 1 one codetracer--sessions)
+      (puthash 2 two codetracer--sessions)
+      (cl-letf (((symbol-function 'codetracer--current-tab-session) (lambda () current)))
+        (codetracer--mark-execution one (current-buffer) (funcall line 2))
+        (setq current two)
+        (codetracer--mark-execution two (current-buffer) (funcall line 4))
+        (should-not (funcall drawn one))
+        (should (funcall drawn two))
+        ;; back to the first tab
+        (setq current one)
+        (codetracer--show-current-execution)
+        (should (funcall drawn one))
+        (should-not (funcall drawn two))))))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
   (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x" "Escape"))

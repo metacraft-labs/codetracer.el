@@ -674,8 +674,10 @@ The debugger keys follow the tab, whoever selected it."
   (unless codetracer--realizing
     (when-let ((session (codetracer--current-tab-session)))
       (codetracer--activate session)))
-  ;; A file two sessions hold tests for shows the current tab's.
+  ;; A file two sessions hold tests for shows the current tab's; a file
+  ;; two sessions are stopped in, the current tab's stop.
   (codetracer--render-all-tests)
+  (codetracer--show-current-execution)
   (codetracer--sync-source-keys))
 
 (defun codetracer-close-session (id)
@@ -2051,13 +2053,33 @@ window when it is not a side window, else any live window that is not."
         (goto-char pos)
         (codetracer--ensure-mark-margin buffer)
         (let ((ov (make-overlay (line-beginning-position) (1+ (line-end-position)))))
-          (overlay-put ov 'face 'codetracer-execution-line)
-          (overlay-put ov 'before-string
+          (overlay-put ov 'codetracer-mark-string
                        (codetracer--fringe-string 'right-triangle 'codetracer-execution-fringe
                                                   "▶"))
+          (overlay-put ov 'face 'codetracer-execution-line)
+          (overlay-put ov 'before-string (overlay-get ov 'codetracer-mark-string))
           (overlay-put ov 'codetracer t)
           (overlay-put ov 'priority 10)
-          (puthash key (list ov) (codetracer-session-decorations session)))))))
+          (puthash key (list ov) (codetracer-session-decorations session))))))
+  (codetracer--show-current-execution))
+
+(defun codetracer--show-current-execution ()
+  "Draw the execution line of the current tab's session only.
+Two sessions on one program show the same file buffer, and each marks
+the line it is stopped on there; both marks showed in every tab, so the
+tab of a trace opened from a session showed that session's stop as well
+as its own.  The other sessions' marks are kept and drawn again when
+their tab is selected."
+  (let ((current (codetracer--current-tab-session)))
+    (maphash
+     (lambda (id session)
+       (dolist (ov (gethash (cons :execution id) (codetracer-session-decorations session)))
+         (when (overlay-buffer ov)
+           (let ((shown (or (null current) (eq session current))))
+             (overlay-put ov 'face (and shown 'codetracer-execution-line))
+             (overlay-put ov 'before-string
+                          (and shown (overlay-get ov 'codetracer-mark-string)))))))
+     codetracer--sessions)))
 
 (defun codetracer--report-source-viewport (session window)
   "Tell the server the lines visible in SESSION's source WINDOW.
