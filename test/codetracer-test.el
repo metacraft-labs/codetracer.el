@@ -160,6 +160,36 @@
         (should (funcall drawn one))
         (should-not (funcall drawn two))))))
 
+;; Recording a test builds and runs it: the request is not waited for, so
+;; Emacs keeps reading input meanwhile, and the answer is shown when it
+;; comes.  The stand-in is the transport, jsonrpc's two request calls: a
+;; synchronous request fails the test (it is what froze Emacs), and the
+;; asynchronous one keeps its callback for the test to answer with -- no
+;; recording happens, and none is needed to say who waits for it.
+(ert-deftest codetracer-test-test-recording-is-not-waited-for ()
+  :tags '(unit)
+  (let* ((session (codetracer--make-session :id 3))
+         (control '(:testId "test_passes" :name "test_passes" :open (:enabled t)))
+         (answer nil) (sent nil) (shown nil))
+    (cl-letf (((symbol-function 'codetracer--live-p) (lambda () t))
+              ((symbol-function 'jsonrpc-request)
+               (lambda (&rest _) (error "Emacs waited for the recording")))
+              ((symbol-function 'jsonrpc-async-request)
+               (lambda (_conn method params &rest keys)
+                 (setq sent (list method params)
+                       answer (plist-get keys :success-fn))))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) shown))))
+      (codetracer--record-test session control)
+      ;; returned at once, the request sent and still unanswered
+      (should (equal (car sent) :operation/run))
+      (should (equal (plist-get (cadr sent) :operation) "tests.open-test"))
+      (should (equal (plist-get (plist-get (cadr sent) :args) :path) "test_passes"))
+      (should (equal (car shown) "CodeTracer: recording test_passes..."))
+      ;; the answer, when it comes, is said
+      (funcall answer '(:ok t :detail "test_passes recorded"))
+      (should (equal (car shown) "CodeTracer: test_passes recorded")))))
+
 (ert-deftest codetracer-test-codetracer-keys-round-trip ()
   :tags '(unit)
   (dolist (key '("n" "Ctrl+F5" "Alt+Left" "Enter" "PageDown" "Ctrl+x" "Escape"))

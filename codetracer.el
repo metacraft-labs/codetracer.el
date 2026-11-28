@@ -113,6 +113,12 @@ own file pane reports them."
   "Seconds to wait for the pane server to answer a request."
   :type 'number)
 
+(defcustom codetracer-test-record-timeout 900
+  "Seconds to wait for a test's recording before saying it timed out.
+Recording a test builds and runs it, so this is longer than
+`codetracer-request-timeout'.  Emacs is not held while it records."
+  :type 'integer)
+
 (defcustom codetracer-media nil
   "The media this Emacs takes from the pane server (`initialize').
 Nil means all it can draw: text, and images when `display-images-p'."
@@ -404,10 +410,11 @@ Window changes made then are not the user's edits.")
   (jsonrpc-request (codetracer--connection) method (or params '())
                    :timeout codetracer-request-timeout))
 
-(defun codetracer--send (method &optional params on-result on-failure)
+(defun codetracer--send (method &optional params on-result on-failure timeout)
   "Send METHOD with PARAMS without waiting; ON-RESULT receives its result.
 ON-FAILURE, when given, is called with no argument when the request
-fails or times out instead.  Return non-nil when the request was sent.
+fails or times out instead.  TIMEOUT, in seconds, replaces
+`codetracer-request-timeout'.  Return non-nil when the request was sent.
 For requests made from notification handlers, hooks and timers:
 `jsonrpc' dispatches the server's messages from timers, and a request
 that waited there could run while another waits, out of order."
@@ -421,7 +428,7 @@ that waited there could run while another waits, out of order."
                            :timeout-fn (lambda ()
                                          (message "CodeTracer: %s timed out" method)
                                          (when on-failure (funcall on-failure)))
-                           :timeout codetracer-request-timeout)
+                           :timeout (or timeout codetracer-request-timeout))
     t))
 
 (defun codetracer--notify (method &optional params)
@@ -2330,11 +2337,21 @@ cannot act now shows why instead."
            (message "CodeTracer: %s" (or (plist-get open :title)
                                          "this test cannot be recorded now")))
           (t
-           (codetracer--run "tests.open-test"
-                            :session (codetracer-session-id session)
-                            :pane "testResults"
-                            :args `(:path ,(plist-get control :testId)
-                                          ,@(when here '(:text "redirect"))))))))
+           ;; Not waited for: the server records the test before it answers,
+           ;; which takes as long as the test's build and run, and Emacs
+           ;; stayed frozen meanwhile.  The recording arrives as
+           ;; `session/opened'; the answer says how it went.
+           (message "CodeTracer: recording %s..."
+                    (or (plist-get control :name) (plist-get control :testId)))
+           (codetracer--send :operation/run
+                             `(:session ,(codetracer-session-id session)
+                                        :operation "tests.open-test"
+                                        :pane "testResults"
+                                        :args (:path ,(plist-get control :testId)
+                                                     ,@(when here '(:text "redirect"))))
+                             (lambda (result)
+                               (codetracer--show-run-result "tests.open-test" result))
+                             nil codetracer-test-record-timeout)))))
 
 (defun codetracer--test-at-event (event)
   "The (SESSION . CONTROL) of the test on the line EVENT was on, or nil."
